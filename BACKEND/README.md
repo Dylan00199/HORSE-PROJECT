@@ -10,37 +10,15 @@ Backend được tổ chức theo modular monolith và package-by-feature. Phiê
 
 ## Khởi chạy local
 
-Mở thư mục `../DATABASE` bằng SSMS, đăng nhập `sa` và chạy lần lượt:
-
-1. `00_create_database.sql`
-2. `01_create_schema.sql`
-3. `02_seed_data.sql`
-4. `03_horse_role_features.sql`
-5. `04_cloudinary_profile_files.sql`
-6. `05_training_evaluations.sql`
-7. `06_training_plans_scheduling_monitoring.sql`
-8. `07_health_medical.sql`
-9. `08_stable_care_inventory.sql`
-10. `09_racing_reporting_rbac_audit.sql`
-11. `10_confirmed_business_rules.sql`
-12. `11_confirmed_automation_and_governance.sql`
-13. `12_compact_schema.sql`
-
-Sau đó chạy backend:
+Tạo `racehorse_local` theo `../DATABASE/README.md` bằng `../DATABASE/setup-local.ps1`. Script chạy baseline `00`–`10` rồi các bản vá `32`–`35`. Không dùng `-RecreateDatabase` khi muốn giữ dữ liệu hiện có. Đặt `JWT_SECRET` như hướng dẫn bên dưới, sau đó chạy backend với profile `local`:
 
 ```powershell
-mvn spring-boot:run
+mvn spring-boot:run "-Dspring-boot.run.profiles=local"
 ```
 
-Mặc định API chạy tại `http://localhost:8080`. Script `02_seed_data.sql` tạo tài khoản quản lý câu lạc bộ `admin@gmail.com / Admin123` nếu email này chưa tồn tại. Mật khẩu được mã hóa BCrypt trước khi lưu vào database. Hãy thay thông tin đăng nhập mặc định khi triển khai production.
+API chạy tại `http://localhost:8080`. Script `09_seed_reference_data.sql` tạo tài khoản quản lý mẫu `admin@gmail.com / Admin123` nếu email này chưa tồn tại. Hãy thay thông tin đăng nhập mẫu khi triển khai production.
 
-Chuỗi kết nối mặc định:
-
-```text
-jdbc:sqlserver://racehorse-training-management.database.windows.net:1433;databaseName=racehorse;encrypt=true;trustServerCertificate=true
-```
-
-Backend mặc định trỏ tới Azure SQL với username `racehorse_admin`. Mật khẩu không được lưu trong source; bắt buộc cung cấp bằng biến môi trường `DB_PASSWORD`. Có thể ghi đè kết nối bằng `DB_URL` và `DB_USERNAME`.
+Backend dùng profile `local` để kết nối SQL Server trên máy phát triển bằng tài khoản thử nghiệm. Khi chạy trên host, không bật profile `local`; đặt `DB_URL`, `DB_USERNAME` và `DB_PASSWORD` bằng biến môi trường của host. Không lưu mật khẩu DB thật trong source hoặc image.
 
 Để bật upload Cloudinary, đặt các biến môi trường sau trước khi chạy backend. Không commit API secret vào repository:
 
@@ -52,6 +30,29 @@ CLOUDINARY_FOLDER=racehorse
 ```
 
 Cấu hình nằm tại `src/main/resources/application.properties`. `spring.jpa.hibernate.ddl-auto=none` bảo đảm ứng dụng không tự tạo hoặc thay đổi schema; mọi thay đổi database phải được viết thành script mới trong `../DATABASE` và chạy chủ động bằng SSMS.
+
+`JWT_SECRET` là bắt buộc cho cả profile mặc định và `local`: cung cấp chuỗi Base64 của ít nhất 32 byte ngẫu nhiên qua biến môi trường hoặc secret store trước khi chạy backend. Khóa phát triển cũ đã công khai và bị từ chối. Có thể tạo một khóa mới cho môi trường local trong PowerShell:
+
+```powershell
+$jwtBytes = [byte[]]::new(32)
+[System.Security.Cryptography.RandomNumberGenerator]::Fill($jwtBytes)
+$env:JWT_SECRET = [Convert]::ToBase64String($jwtBytes)
+```
+
+Lưu khóa riêng ở nơi an toàn và dùng lại qua các lần khởi động. Đổi khóa sẽ khiến access token hiện có hết hiệu lực; refresh token còn hiệu lực vẫn có thể cấp access token mới. Nếu cần buộc tất cả người dùng đăng nhập lại, phải thu hồi các phiên đăng nhập đang hoạt động. Không commit giá trị thật vào `.env.example` hoặc source code.
+
+## Triển khai Render, Vercel và Supabase
+
+Backend production dùng VNPAY Sandbox để kiểm thử checkout và IPN (không thu tiền thật). Để chạy trên host:
+
+1. Vercel đặt `VITE_API_URL=https://horse-project-4qa4.onrender.com` trước khi build. Render đặt `CORS_ALLOWED_ORIGINS=https://horse-project-phi.vercel.app`.
+2. Render dùng cấu hình trong `../render.yaml`. Các biến có `sync: false` phải được nhập bằng secret store của Render; tuyệt đối không commit giá trị thật.
+3. Thiết lập `SUPABASE_DB_URL`, `SUPABASE_DB_USERNAME`, `SUPABASE_DB_PASSWORD` từ Supabase Connect > Session pooler cổng `5432`. Profile production là `supabase`.
+4. Supabase GitHub Integration theo dõi `develop`, working directory `DATABASE`, và chỉ áp dụng migration mới trong `supabase/migrations`. Không chạy script SQL Server local lên Supabase.
+5. Đặt `PAYOS_GATEWAY=vnpay`, cấp `VNPAY_TMN_CODE`, `VNPAY_HASH_SECRET` và `VNPAY_RETURN_URL` qua Render. Trong VNPAY Merchant Sandbox, cấu hình IPN URL `https://horse-project-4qa4.onrender.com/api/wallet/vnpay/ipn`.
+6. Sau mỗi deploy, xác nhận `/actuator/health`, đăng nhập, tạo VNPAY Sandbox checkout và kiểm tra IPN cập nhật ví đúng một lần.
+
+VNPAY Sandbox checkout được tạo từ backend; VNPAY xác nhận giao dịch qua IPN đã ký trước khi cộng tiền vào ví. Không dùng tài khoản/thẻ Sandbox cho giao dịch thật.
 
 Kiểm tra health endpoint không cần đăng nhập:
 
@@ -81,6 +82,20 @@ mvn test
 | `GET` | `/api/users/roles` | Quản lý câu lạc bộ xem các role hợp lệ |
 | `PUT` | `/api/users/{id}/roles` | Quản lý câu lạc bộ thay role tài khoản khác |
 | `POST` | `/api/horses` | Tạo hồ sơ ngựa |
+| `GET` | `/api/horse-intake/waiting-room/pending` | Staff/Club Manager xem ngựa đã thanh toán hoặc được bảo lãnh, đang chờ đưa vào phòng chờ |
+| `POST` | `/api/horse-intake/{horseId}/waiting-room` | Staff/Club Manager xác nhận đã đưa ngựa vào phòng chờ; không đổi `paymentStatus` |
+| `GET` | `/api/medical/queue` | Bác sĩ xem ngựa đang ở phòng chờ |
+| `GET` | `/api/medical/queue/overview` | Mọi bác sĩ xem ngựa chờ khám và ca đã được bác sĩ khác tiếp nhận (chỉ xem trạng thái) |
+| `POST` | `/api/medical/queue/{horseId}/receive` | Bác sĩ nhận ngựa từ phòng chờ để khám |
+| `POST` | `/api/medical/queue/{horseId}/complete` | Bác sĩ hoàn tất sau khi lưu hồ sơ khám; ngựa chuyển sang chờ ô chuồng |
+| `GET` | `/api/medical/follow-ups` | Bác sĩ xem lịch khám tháng/tái khám và yêu cầu khám thay hoặc bàn giao; mỗi mục có `visitType`, `handoverMode` |
+| `POST` | `/api/medical/follow-ups/{id}/handover` | Gửi `{ "reason": "...", "mode": "COVER_VISIT" }` để nhờ khám thay một lần; dùng `TRANSFER_CARE` để chuyển bác sĩ phụ trách lâu dài |
+| `POST` | `/api/medical/follow-ups/{id}/accept` | Bác sĩ khác nhận yêu cầu; chỉ người nhận đầu tiên thành công |
+| `POST` | `/api/medical/follow-ups/{id}/handover/cancel` | Bác sĩ đã gửi rút yêu cầu khi chưa ai nhận |
+
+Lịch khám hằng tháng chỉ được lập sau khi đã có phiếu khám lâm sàng thật. Dữ liệu cũ có bác sĩ phụ trách nhưng chưa có phiếu khám cần được khám lần đầu; hệ thống không tạo phiếu khám giả để hợp thức hóa lịch.
+| `GET` | `/api/horse-intake/stall/pending` | Staff/Club Manager xem ngựa đã khám xong, chờ phân ô chuồng, kể cả ngựa bị thương |
+| `POST` | `/api/stables/{stableId}/stalls/{stallId}/assign` | Staff/Club Manager phân ô chuồng cho ngựa đã khám xong |
 | `GET` | `/api/horses/{id}` | Xem chi tiết hồ sơ |
 | `GET` | `/api/horses` | Tìm kiếm, lọc trạng thái và phân trang |
 | `GET` | `/api/horses/mine` | Chủ sở hữu xem danh sách ngựa mình sở hữu |
@@ -106,13 +121,14 @@ mvn test
 | `POST` | `/api/training-plans/{id}/copy` | Sao chép kế hoạch cho ngựa khác |
 | `GET` | `/api/training-plans/{id}` | Xem chi tiết kế hoạch và các giai đoạn |
 | `GET` | `/api/horses/{id}/training-plans` | Danh sách kế hoạch của một ngựa |
-| `POST` | `/api/training-schedules` | Tạo lịch từ giai đoạn của kế hoạch active FR05 |
+| `POST` | `/api/training-schedules` | Tạo lịch từ giai đoạn active; body bắt buộc có `trainingDate` và `slotStart` (06:00–23:00, đúng giờ) |
+| `PUT` | `/api/training-schedules/{id}` | Sửa lịch; body cũng cần `slotStart` |
 | `POST` | `/api/training-schedules/{id}/publish` | Công bố lịch và tạo thông báo cho nhân viên |
 | `GET` | `/api/training-schedules?from=&to=&horseId=` | Lịch huấn luyện dành cho quản lý/HLV trưởng |
 | `GET` | `/api/training-schedules/mine?from=&to=` | Nhân viên xem lịch đã công bố của mình |
 | `POST` | `/api/racetracks` | Quản lý tạo đường đua và số làn |
 | `GET` | `/api/racetracks` | Quản lý/HLV trưởng xem danh sách đường đua |
-| `GET` | `/api/racetracks/{id}/slots?date=` | Xem các slot trống/đã đặt theo ngày và làn |
+| `GET` | `/api/racetracks/{id}/availability?date=YYYY-MM-DD&slotStart=HH:mm` | Xem làn còn trống trong slot 1 giờ đã chọn |
 | `POST` | `/api/trial-run-bookings` | Quản lý/HLV trưởng đặt một slot chạy thử |
 | `GET` | `/api/notifications?unreadOnly=` | Người dùng xem thông báo của chính mình |
 | `PATCH` | `/api/notifications/{id}/read` | Đánh dấu thông báo đã đọc |
@@ -121,14 +137,18 @@ mvn test
 | `GET` | `/api/horses/{id}/training-locks/current` | Xem khóa đang hoạt động |
 | `GET` | `/api/horses/{id}/training-locks` | Xem lịch sử khóa huấn luyện |
 
+Luồng tiếp nhận dùng `intakeStatus` trong `HorseResponse`: `PENDING_WAITING_ROOM` → `WAITING_FOR_VET` → `IN_MEDICAL` → `PENDING_STALL` → `STABLED`. `paymentStatus` vẫn chỉ biểu thị thanh toán; bảo lãnh của Club Manager dùng `serviceOverride`. Khi nhân viên đưa ngựa vào phòng chờ, mọi bác sĩ đang hoạt động được thông báo. Bác sĩ đầu tiên tiếp nhận được ghi vào ca khám ban đầu; bác sĩ khác chỉ xem trạng thái. Khi hoàn tất ca, `diagnosingVet` trở thành bác sĩ phụ trách ngựa lâu dài, hiển thị ở mục “Ngựa tôi phụ trách” trên web. Mỗi phiếu khám tạo lịch kiểm tra tiếp theo không muộn hơn một tháng lịch tính từ ngày khám; nếu bác sĩ đặt ngày tái khám sớm hơn, dùng ngày đó. `COVER_VISIT` chỉ chuyển quyền ghi phiếu cho một lần khám; lần kế tiếp quay về bác sĩ phụ trách ngựa. `TRANSFER_CARE` đổi `diagnosingVet` khi bác sĩ khác chấp nhận và chuyển cả các lịch tương lai. Mỗi yêu cầu chỉ có một người nhận; người gửi có thể rút trước khi được nhận. Khi đang chờ nhận, không ai được ghi phiếu cho ca đó. Club Manager không phải duyệt hay phân công. Ngựa bị thương vẫn được phân ô chuồng để chăm sóc, nhưng chỉ có thể gán HLV và tạo/bắt đầu lịch tập khi ở `STABLED`, sức khỏe `FIT`, có phân ô còn hiệu lực và không còn khóa huấn luyện.
+
 ## Phân quyền API đã triển khai
 
 | Chức năng | CLUB_MANAGER | HEAD_TRAINER | HORSE_OWNER | STABLE_STAFF | VETERINARIAN |
 |---|---:|---:|---:|---:|---:|
 | Quản lý tài khoản và role | Có | Không | Không | Không | Không |
-| Tạo/sửa/lưu trữ hồ sơ ngựa | Có | Có | Không | Không | Không |
-| Gán huấn luyện viên và tỷ lệ sở hữu | Có | Có | Không | Không | Không |
-| Tìm kiếm toàn bộ ngựa | Có | Có | Không | Không | Không |
+| Tạo hồ sơ ngựa | Có | Không | Có, ngựa của mình | Không | Không |
+| Sửa/lưu trữ hồ sơ quản trị | Có | Không | Chỉ sửa thông tin được phép của ngựa mình | Không | Không |
+| HLV tự tiếp nhận ngựa đã khám, đủ điều kiện và có ô chuồng | Không | Có | Không | Không | Không |
+| Quản lý tỷ lệ sở hữu | Có | Không | Không | Không | Không |
+| Tìm kiếm ngựa | Toàn bộ | Chỉ ngựa đang phụ trách | Chỉ ngựa đang sở hữu | Theo điều kiện tiếp nhận | Theo điều kiện tiếp nhận |
 | Xem hồ sơ/phả hệ/lịch sử đua | Có | Có | Chỉ ngựa đang sở hữu | Không | Không |
 | Thêm/sửa kết quả đua lịch sử | Có | Có | Không | Không | Không |
 | Xem file hồ sơ chính | Có | Có | Có | Có | Có |
@@ -147,6 +167,12 @@ mvn test
 | Xem thông báo của chính mình | Có | Có | Có | Có | Có |
 
 `CLUB_MANAGER` là admin nghiệp vụ. `HORSE_OWNER` bị kiểm tra quyền sở hữu theo dữ liệu `horse_ownerships`, không chỉ kiểm tra role trong JWT. Hồ sơ đã lưu trữ không xuất hiện trong tìm kiếm hoặc danh sách của chủ sở hữu.
+
+Với API chăm sóc, Owner chỉ đọc dữ liệu của ngựa mình sở hữu: `GET /api/care-tasks` và `GET /api/incidents` bắt buộc truyền `horseId`; API chi tiết, ảnh nhiệm vụ, dinh dưỡng và lịch sinh hoạt đều kiểm tra sở hữu trước khi trả dữ liệu. Các danh sách toàn câu lạc bộ (`/api/stables`, `/api/nutrition/*`, `/api/inventory/*`) không cấp cho Owner. Nhân viên và các role nghiệp vụ khác vẫn dùng quyền được phân trong ma trận RBAC.
+
+Hoàn thành nhiệm vụ chăm sóc (`POST /api/care-tasks/{id}/complete`): Stable Staff chỉ hoàn thành nhiệm vụ được giao cho chính mình; nhiệm vụ định kỳ chưa phân công là việc chung, người hoàn thành đầu tiên được ghi vào `assigned_staff_id`. Club Manager có thể hoàn thành thay khi cần; Head Trainer chỉ tạo/phân công/hủy, không đánh dấu hoàn thành; Stable Staff không tự tạo hoặc hủy nhiệm vụ. Cập nhật trạng thái sự cố (`PUT /api/incidents/{id}/status`, `POST /acknowledge`, `POST /dismiss`): Stable Staff chỉ thao tác báo cáo do mình gửi; Veterinarian và Club Manager có thể xử lý báo cáo của người khác.
+
+Ca cấp cứu (mức `HIGH`/`CRITICAL`): tất cả bác sĩ thú y được thông báo và xem qua `GET /api/incidents`. Bác sĩ nhận đầu tiên gọi `POST /api/incidents/{id}/claim-emergency` (cần `PERM_MEDICAL_EDIT`); chỉ người đó được lập phiếu khám cho ngựa qua `POST /api/horses/{horseId}/medical-examinations` trong lúc ca đang mở. Lưu phiếu khám đóng ca cấp cứu và ghi liên kết `emergencyExaminationId`; bác sĩ phụ trách lâu dài của ngựa không đổi. Thao tác `acknowledge` thông thường không áp dụng cho ca cấp cứu chưa ai nhận.
 
 Các endpoint phân trang trả cấu trúc ổn định gồm `content` và `page` (`size`, `number`, `totalElements`, `totalPages`). Tham số `sort` có dạng `field,direction`, ví dụ `sort=name,asc`.
 
@@ -486,9 +512,9 @@ Module `training` chứa FR03–FR07; telemetry FR06 do Head Trainer nhập th�
 - `HORSE_OWNER`
 - `VETERINARIAN`
 
-`CLUB_MANAGER` là admin nghiệp vụ: quản lý tài khoản, gán role và quản lý dữ liệu câu lạc bộ. API chỉnh sửa hồ sơ ngựa dành cho `CLUB_MANAGER` và `HEAD_TRAINER`. `HORSE_OWNER` chỉ xem được ngựa có liên kết sở hữu thực tế trong database.
+`CLUB_MANAGER` là admin nghiệp vụ: quản lý tài khoản, gán role và quản lý dữ liệu câu lạc bộ. Chỉ Club Manager được tạo hồ sơ thay chủ ngựa, chuyển quyền sở hữu hoặc lưu trữ hồ sơ; Horse Owner có thể tạo và sửa các trường được phép trên ngựa của mình. Head Trainer không được thực hiện các thao tác quản trị hồ sơ này.
 
-Khi đổi role, `CLUB_MANAGER` gửi toàn bộ danh sách role thay thế tới `PUT /api/users/{id}/roles`. Danh sách không được rỗng. Quản lý câu lạc bộ không thể dùng endpoint này để tự thay đổi role của chính mình.
+Khi đổi role, `CLUB_MANAGER` gửi toàn bộ danh sách role thay thế tới `PUT /api/users/{id}/roles`. Danh sách phải có đúng một role. Chỉ tài khoản chưa có dữ liệu nghiệp vụ hoặc phân công mới được đổi role; phiên đăng nhập và thông báo không tính là nghiệp vụ. Quản lý câu lạc bộ không thể tự đổi role của chính mình. Gửi lại role hiện tại không thu hồi phiên và không ghi audit thay đổi giả.
 
 ## API nghiệp vụ mới đã chốt
 
@@ -513,10 +539,13 @@ Nguồn nghiệp vụ cho ngưỡng nghỉ: [AAEP Care Guidelines](https://aaep.
 
 ### Chăm sóc phòng ngừa FR12
 
+Lịch tiêm phòng, tẩy giun và chăm sóc móng là lịch riêng của ngựa, không tự tạo theo phiếu khám. `POST /api/horses/{horseId}/medical-examinations` từ chối các trường `preventiveCareSchedule` và `preventiveSchedules`; dùng API dưới đây để tạo lịch. Lịch kiểm tra sức khỏe hằng tháng/tái khám thuộc quy trình khám bệnh và là loại lịch khác.
+
 - `POST /api/horses/{horseId}/preventive-care` — bác sĩ tạo lịch, chu kỳ và số ngày báo trước.
+- `careType` nhận `VACCINATION`, `DEWORMING`, `FARRIER` hoặc `OTHER`. Với `OTHER`, gửi thêm `careName` (tên tự nhập, tối đa 120 ký tự). `details` là mô tả tùy chọn. Lịch mới mặc định không lặp; chỉ tạo lịch kế tiếp sau khi xác nhận hoàn tất nếu bác sĩ đã chọn `recurrenceDays`. Ngày kế tiếp tính từ ngày thực hiện thực tế.
 - `GET /api/horses/{horseId}/preventive-care` — xem và lọc lịch theo loại, trạng thái, khoảng ngày.
 - `PUT|DELETE /api/preventive-care/{id}` — bác sĩ sửa hoặc hủy lịch chưa hoàn thành.
-- `POST /api/preventive-care/{id}/complete` — bác sĩ xác nhận hoàn thành; lịch kế tiếp tự sinh nếu có `recurrenceDays`.
+- `POST /api/preventive-care/{id}/complete` — xác nhận hoàn thành; lịch kế tiếp tự sinh đúng một lần nếu có `recurrenceDays`. Các yêu cầu hoàn thành đồng thời được khóa theo lịch, yêu cầu đến sau nhận lỗi đã xử lý.
 - Job chạy 06:00 theo `app.club-time-zone`, tạo nhắc lịch đến hạn và báo cáo ngày cho chủ sở hữu. Báo cáo hiện dùng VND; phân bổ chi phí cho nhiều chủ sở hữu được để lại cho giai đoạn sau.
 
 ### Ma trận quyền và audit
@@ -529,7 +558,7 @@ Nguồn nghiệp vụ cho ngưỡng nghỉ: [AAEP Care Guidelines](https://aaep.
 
 ### API quản trị nghiệp vụ bổ sung
 
-- `/api/admin/accounts` — lọc tài khoản theo từ khóa, role và trạng thái; sửa thông tin, khóa/mở khóa và đặt lại mật khẩu. Khóa, đặt lại mật khẩu hoặc đổi role sẽ thu hồi các phiên hiện tại.
+- `/api/admin/accounts` — lọc tài khoản theo từ khóa, role và trạng thái; sửa thông tin, khóa/mở khóa và đặt lại mật khẩu. Khi khóa, tài khoản không được còn sở hữu ngựa đang hoạt động, đang phụ trách ngựa, giữ ca khám hoặc có việc chăm sóc chưa hoàn thành. Khóa, đặt lại mật khẩu hoặc đổi role thực sự sẽ thu hồi các phiên hiện tại.
 - `/api/admin/horses/archived` và `/api/admin/horses/{id}/restore` — xem và khôi phục hồ sơ ngựa đã lưu trữ.
 - `/api/admin/dashboard?month=YYYY-MM&compareTo=YYYY-MM` — dashboard tháng gồm số buổi tập, số ngựa được tập, trạng thái xanh/vàng/đỏ, doanh thu, chi phí và chênh lệch VND.
 - `/api/admin/audit-logs` và `/api/admin/audit-logs/{id}` — tra cứu danh sách và chi tiết nhật ký; thao tác quản trị tài khoản lưu dữ liệu trước/sau thay đổi.
@@ -541,7 +570,7 @@ Nguồn nghiệp vụ cho ngưỡng nghỉ: [AAEP Care Guidelines](https://aaep.
 - `POST /api/inventory/replenishments/{id}/review` — body `{ "status": "APPROVED", "reviewNotes": "...", "receiveImmediately": false }`. Club Manager có thể duyệt trước hoặc vừa duyệt vừa xác nhận nhập kho; từ chối không thay đổi tồn.
 - `POST /api/inventory/replenishments/{id}/receive` — body `{ "catalogItemId": null, "referencePriceVnd": 45000, "minThreshold": 10, "location": "Kho A" }`. Chỉ áp dụng đề xuất `APPROVED`; tăng tồn đúng một lần và đổi thành `FULFILLED`. Nếu đề xuất là vật tư mới, API tạo mặt hàng mới khi nhập kho hoặc gắn với `catalogItemId` cùng danh mục/đơn vị.
 - `/api/financial-transactions` — ghi sổ thu/chi VND, tra cứu và tổng hợp. Giao dịch là sổ cái chỉ thêm, không sửa/xóa.
-- `/api/races` — CRUD giải đua; đăng ký, xác nhận và rút đăng ký ngựa.
+- `/api/races` — Club Manager tạo/sửa/ngừng/hoàn thành giải đua. Head Trainer đăng ký, xác nhận sau khi chủ ngựa duyệt và rút đăng ký chỉ cho ngựa mình đang phụ trách; Club Manager có thể thao tác đăng ký toàn CLB. Horse Owner chỉ duyệt/từ chối đăng ký của ngựa mình, không thể xác nhận chính thức. Danh sách đăng ký của Head Trainer được lọc theo ngựa đang phụ trách và còn đủ điều kiện dịch vụ.
 - `/api/owner-reports` — xem, tạo và tải báo cáo JSON. Job 06:00 tạo báo cáo ngày và thông báo cho chủ sở hữu.
 - `/api/trial-run-bookings` — đặt, xem danh sách và hủy lượt chạy thử.
 - `/api/files` — upload, xem metadata và xóa file Cloudinary dùng chung; chỉ nhận ảnh, PDF hoặc DOCX.

@@ -4,6 +4,7 @@ import com.racehorse.caretask.dto.CareTaskResponse;
 import com.racehorse.caretask.dto.CompleteCareTaskRequest;
 import com.racehorse.caretask.dto.CreateCareTaskRequest;
 import com.racehorse.caretask.service.CareTaskService;
+import com.racehorse.horse.service.OwnerHorseReadGuard;
 import jakarta.validation.Valid;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpHeaders;
@@ -12,6 +13,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.core.Authentication;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
@@ -26,9 +28,11 @@ import java.util.UUID;
 public class CareTaskController {
 
     private final CareTaskService service;
+    private final OwnerHorseReadGuard ownerGuard;
 
-    public CareTaskController(CareTaskService service) {
+    public CareTaskController(CareTaskService service, OwnerHorseReadGuard ownerGuard) {
         this.service = service;
+        this.ownerGuard = ownerGuard;
     }
 
     @GetMapping
@@ -38,25 +42,39 @@ public class CareTaskController {
             @RequestParam(required = false) UUID assignedStaffId,
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             @RequestParam(required = false) String status,
-            @RequestParam(required = false) Boolean overdueOnly) {
+            @RequestParam(required = false) Boolean overdueOnly,
+            @AuthenticationPrincipal Jwt jwt, Authentication authentication) {
+        ownerGuard.requireHorse(horseId, jwt, authentication);
+        if (staff(authentication)) {
+            return service.listStaffTasks(UUID.fromString(jwt.getSubject()), date, status, overdueOnly);
+        }
         return service.listTasks(horseId, assignedStaffId, date, status, overdueOnly);
     }
 
     @GetMapping("/{id}")
     @PreAuthorize("hasAuthority('PERM_STABLE_CARE_VIEW')")
-    public CareTaskResponse getTask(@PathVariable UUID id) {
-        return service.getTask(id);
+    public CareTaskResponse getTask(@PathVariable UUID id, @AuthenticationPrincipal Jwt jwt,
+            Authentication authentication) {
+        CareTaskResponse task = service.getTask(id);
+        ownerGuard.requireHorse(task.horseId(), jwt, authentication);
+        requireStaffTask(task, jwt, authentication);
+        return task;
     }
 
     @GetMapping("/{id}/photo")
-    public ResponseEntity<?> getTaskPhoto(@PathVariable UUID id) {
+    @PreAuthorize("hasAuthority('PERM_STABLE_CARE_VIEW')")
+    public ResponseEntity<?> getTaskPhoto(@PathVariable UUID id, @AuthenticationPrincipal Jwt jwt,
+            Authentication authentication) {
+        CareTaskResponse task = service.getTask(id);
+        ownerGuard.requireHorse(task.horseId(), jwt, authentication);
+        requireStaffTask(task, jwt, authentication);
         CareTaskService.TaskPhotoData photo = service.getTaskPhoto(id);
         if (photo.bytes() != null && photo.bytes().length > 0) {
             String ct = photo.contentType() != null && !photo.contentType().isBlank()
                     ? photo.contentType()
                     : MediaType.APPLICATION_OCTET_STREAM_VALUE;
             return ResponseEntity.ok()
-                    .header(HttpHeaders.CACHE_CONTROL, "public, max-age=604800")
+                    .header(HttpHeaders.CACHE_CONTROL, "private, no-store")
                     .contentType(MediaType.parseMediaType(ct))
                     .body(photo.bytes());
         }
@@ -68,7 +86,7 @@ public class CareTaskController {
 
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
-    @PreAuthorize("hasAnyRole('HEAD_TRAINER','CLUB_MANAGER') and hasAuthority('PERM_STABLE_CARE_EDIT')")
+    @PreAuthorize("hasRole('CLUB_MANAGER') or (hasRole('HEAD_TRAINER') and hasAuthority('PERM_STABLE_CARE_EDIT'))")
     public CareTaskResponse createTask(
             @AuthenticationPrincipal Jwt jwt,
             @Valid @RequestBody CreateCareTaskRequest request) {
@@ -76,29 +94,47 @@ public class CareTaskController {
     }
 
     @PostMapping(value = "/{id}/complete", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    @PreAuthorize("hasAnyRole('STABLE_STAFF','HEAD_TRAINER','CLUB_MANAGER') and hasAuthority('PERM_STABLE_CARE_EDIT')")
+    @PreAuthorize("hasRole('CLUB_MANAGER') or (hasRole('STABLE_STAFF') and hasAuthority('PERM_STABLE_CARE_EDIT'))")
     public CareTaskResponse completeTaskMultipart(
             @PathVariable UUID id,
             @AuthenticationPrincipal Jwt jwt,
+            Authentication authentication,
             @RequestParam(required = false) String notes,
             @RequestPart(value = "file", required = false) MultipartFile file) {
-        return service.completeTask(id, UUID.fromString(jwt.getSubject()), notes, file);
+        return service.completeTask(id, UUID.fromString(jwt.getSubject()), notes, file, manager(authentication));
     }
 
     @PostMapping(value = "/{id}/complete", consumes = {MediaType.APPLICATION_JSON_VALUE, MediaType.ALL_VALUE})
-    @PreAuthorize("hasAnyRole('STABLE_STAFF','HEAD_TRAINER','CLUB_MANAGER') and hasAuthority('PERM_STABLE_CARE_EDIT')")
+    @PreAuthorize("hasRole('CLUB_MANAGER') or (hasRole('STABLE_STAFF') and hasAuthority('PERM_STABLE_CARE_EDIT'))")
     public CareTaskResponse completeTaskJson(
             @PathVariable UUID id,
             @AuthenticationPrincipal Jwt jwt,
+            Authentication authentication,
             @Valid @RequestBody(required = false) CompleteCareTaskRequest request) {
-        return service.completeTask(id, UUID.fromString(jwt.getSubject()), request);
+        return service.completeTask(id, UUID.fromString(jwt.getSubject()), request, manager(authentication));
     }
 
     @PostMapping("/{id}/cancel")
-    @PreAuthorize("hasAnyRole('HEAD_TRAINER','CLUB_MANAGER') and hasAuthority('PERM_STABLE_CARE_EDIT')")
+    @PreAuthorize("hasRole('CLUB_MANAGER') or (hasRole('HEAD_TRAINER') and hasAuthority('PERM_STABLE_CARE_EDIT'))")
     public CareTaskResponse cancelTask(
             @PathVariable UUID id,
             @AuthenticationPrincipal Jwt jwt) {
         return service.cancelTask(id, UUID.fromString(jwt.getSubject()));
+    }
+
+    private boolean manager(Authentication authentication) {
+        return authentication.getAuthorities().stream()
+                .anyMatch(authority -> "ROLE_CLUB_MANAGER".equals(authority.getAuthority()));
+    }
+
+    private boolean staff(Authentication authentication) {
+        return authentication.getAuthorities().stream()
+                .anyMatch(authority -> "ROLE_STABLE_STAFF".equals(authority.getAuthority()));
+    }
+
+    private void requireStaffTask(CareTaskResponse task, Jwt jwt, Authentication authentication) {
+        if (staff(authentication) && !UUID.fromString(jwt.getSubject()).equals(task.assignedStaffId())) {
+            throw new com.racehorse.common.exception.BusinessException("Đây không phải nhiệm vụ được phân công cho bạn");
+        }
     }
 }

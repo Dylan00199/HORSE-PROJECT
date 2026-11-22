@@ -17,6 +17,8 @@ import java.util.*;
 public class FinanceService {
     private static final Set<String> TYPES = Set.of("EXPENSE", "REVENUE");
     private static final Set<String> CATEGORIES = Set.of("FEED_COST", "MEDICAL_COST", "OPERATING_COST", "PRIZE_REVENUE");
+    private static final Set<String> EXPENSE_CATEGORIES = Set.of("FEED_COST", "MEDICAL_COST", "OPERATING_COST");
+    private static final Set<String> REVENUE_CATEGORIES = Set.of("PRIZE_REVENUE");
     private final JdbcTemplate jdbc;
     private final AuditService audit;
 
@@ -33,6 +35,10 @@ public class FinanceService {
         String normalizedCategory = upper(category);
         if (!TYPES.contains(normalizedType)) throw new BusinessException("transactionType chỉ nhận EXPENSE hoặc REVENUE");
         if (!CATEGORIES.contains(normalizedCategory)) throw new BusinessException("category không hợp lệ");
+        if ("EXPENSE".equals(normalizedType) && !EXPENSE_CATEGORIES.contains(normalizedCategory))
+            throw new BusinessException("Danh mục " + normalizedCategory + " không phù hợp với khoản chi (EXPENSE)");
+        if ("REVENUE".equals(normalizedType) && !REVENUE_CATEGORIES.contains(normalizedCategory))
+            throw new BusinessException("Danh mục " + normalizedCategory + " không phù hợp với khoản thu (REVENUE)");
         if (amount == null || amount.signum() < 0) throw new BusinessException("Số tiền phải lớn hơn hoặc bằng 0");
         if (horseId == null && stableId == null) throw new BusinessException("Giao dịch phải thuộc một ngựa hoặc một chuồng");
         if (Set.of("MEDICAL_COST", "PRIZE_REVENUE").contains(normalizedCategory) && horseId == null)
@@ -54,7 +60,7 @@ public class FinanceService {
     @Transactional(readOnly = true)
     public TransactionView get(UUID id, UUID requester, boolean manager) {
         List<Object> args = new ArrayList<>();
-        String sql = baseSelect() + " where ft.id=?";
+        String sql = baseSelect(manager) + " where ft.id=? and " + reportablePredicate(manager);
         args.add(id);
         if (!manager) {
             sql += " and exists(select 1 from horse_ownerships ho where ho.horse_id=ft.horse_id and ho.owner_id=?)";
@@ -70,37 +76,38 @@ public class FinanceService {
                                       LocalDate from, LocalDate to, String type, String category,
                                       int page, int size) {
         if (page < 0 || size < 1 || size > 200) throw new BusinessException("Phân trang không hợp lệ");
-        StringBuilder sql = new StringBuilder(baseSelect()).append(" where 1=1");
+        StringBuilder sql = new StringBuilder(baseSelect(manager)).append(" where ").append(reportablePredicate(manager));
         List<Object> args = new ArrayList<>();
         if (!manager) {
             sql.append(" and exists(select 1 from horse_ownerships ho where ho.horse_id=ft.horse_id and ho.owner_id=?)");
             args.add(requester);
         }
-        add(sql, args, " and ft.horse_id=?", horseId);
+        add(sql, args, " and " + horseColumn(manager) + "=?", horseId);
         add(sql, args, " and ft.stable_id=?", stableId);
         add(sql, args, " and ft.transaction_date>=?", from);
         add(sql, args, " and ft.transaction_date<=?", to);
-        add(sql, args, " and ft.transaction_type=?", cleanUpper(type));
+        add(sql, args, " and " + reportType(manager) + "=?", cleanUpper(type));
         add(sql, args, " and ft.category=?", cleanUpper(category));
-        sql.append(" order by ft.transaction_date desc,ft.created_at desc offset ? rows fetch next ? rows only");
-        args.add(page * size); args.add(size);
+        sql.append(" order by ft.transaction_date desc,ft.created_at desc limit ? offset ?");
+        args.add(size); args.add(page * size);
         return jdbc.query(sql.toString(), this::map, args.toArray());
     }
 
     @Transactional(readOnly = true)
     public long count(UUID requester, boolean manager, UUID horseId, UUID stableId,
                       LocalDate from, LocalDate to, String type, String category) {
-        StringBuilder sql = new StringBuilder("select count(*) from financial_transactions ft where 1=1");
+        StringBuilder sql = new StringBuilder("select count(*) from financial_transactions ft ")
+                .append(walletSourceJoin(manager)).append(" where ").append(reportablePredicate(manager));
         List<Object> args = new ArrayList<>();
         if (!manager) {
             sql.append(" and exists(select 1 from horse_ownerships ho where ho.horse_id=ft.horse_id and ho.owner_id=?)");
             args.add(requester);
         }
-        add(sql, args, " and ft.horse_id=?", horseId);
+        add(sql, args, " and " + horseColumn(manager) + "=?", horseId);
         add(sql, args, " and ft.stable_id=?", stableId);
         add(sql, args, " and ft.transaction_date>=?", from);
         add(sql, args, " and ft.transaction_date<=?", to);
-        add(sql, args, " and ft.transaction_type=?", cleanUpper(type));
+        add(sql, args, " and " + reportType(manager) + "=?", cleanUpper(type));
         add(sql, args, " and ft.category=?", cleanUpper(category));
         Long total = jdbc.queryForObject(sql.toString(), Long.class, args.toArray());
         return total == null ? 0 : total;
@@ -129,22 +136,35 @@ public class FinanceService {
 
     @Transactional(readOnly = true)
     public SummaryView summary(UUID requester, boolean manager, UUID horseId, LocalDate from, LocalDate to) {
-        StringBuilder sql = new StringBuilder("select ft.transaction_type,sum(ft.amount) total from financial_transactions ft where 1=1");
+        StringBuilder sql = new StringBuilder("select ").append(reportType(manager))
+                .append(" transaction_type,sum(ft.amount) total from financial_transactions ft ")
+                .append(walletSourceJoin(manager)).append(" where ")
+                .append(reportablePredicate(manager));
         List<Object> args = new ArrayList<>();
         if (!manager) {
             sql.append(" and exists(select 1 from horse_ownerships ho where ho.horse_id=ft.horse_id and ho.owner_id=?)");
             args.add(requester);
         }
-        add(sql, args, " and ft.horse_id=?", horseId);
+        add(sql, args, " and " + horseColumn(manager) + "=?", horseId);
         add(sql, args, " and ft.transaction_date>=?", from);
         add(sql, args, " and ft.transaction_date<=?", to);
-        sql.append(" group by ft.transaction_type");
+        sql.append(" group by ").append(reportType(manager));
         BigDecimal expense = BigDecimal.ZERO, revenue = BigDecimal.ZERO;
         for (Map<String,Object> row : jdbc.queryForList(sql.toString(), args.toArray())) {
             BigDecimal total = (BigDecimal) row.get("total");
             if ("EXPENSE".equals(row.get("transaction_type"))) expense = total; else revenue = total;
         }
-        return new SummaryView("VND", expense, revenue, revenue.subtract(expense));
+        BigDecimal topup = BigDecimal.ZERO;
+        if (manager && horseId == null) {
+            StringBuilder topupSql = new StringBuilder("select coalesce(sum(ft.amount),0) from financial_transactions ft "
+                    + "where ft.source_entity_type='WALLET' and ft.category='WALLET_TOPUP' and ft.currency='VND'");
+            List<Object> topupArgs = new ArrayList<>();
+            add(topupSql, topupArgs, " and ft.transaction_date>=?", from);
+            add(topupSql, topupArgs, " and ft.transaction_date<=?", to);
+            topup = jdbc.queryForObject(topupSql.toString(), BigDecimal.class, topupArgs.toArray());
+            if (topup == null) topup = BigDecimal.ZERO;
+        }
+        return new SummaryView("VND", expense, revenue, revenue.subtract(expense), topup);
     }
 
     @Transactional(readOnly=true)
@@ -155,11 +175,36 @@ public class FinanceService {
                 this::map,ids.toArray());
     }
 
-    private String baseSelect() {
-        return "select ft.id,ft.horse_id,h.name horse_name,ft.stable_id,s.name stable_name,ft.transaction_date,"
-                + "ft.transaction_type,ft.category,ft.amount,ft.currency,ft.description,ft.source_entity_type,"
+    private String baseSelect() { return baseSelect(false); }
+
+    private String baseSelect(boolean manager) {
+        return "select ft.id," + horseColumn(manager) + " horse_id,h.name horse_name,ft.stable_id,s.name stable_name,ft.transaction_date,"
+                + reportType(manager) + " transaction_type,ft.category,ft.amount,ft.currency,ft.description,ft.source_entity_type,"
                 + "ft.source_entity_id,ft.recorded_by_user_id,ft.created_at from financial_transactions ft "
-                + "left join horses h on h.id=ft.horse_id left join stables s on s.id=ft.stable_id";
+                + walletSourceJoin(manager)
+                + "left join horses h on h.id=" + horseColumn(manager) + " left join stables s on s.id=ft.stable_id";
+    }
+
+    private String walletSourceJoin(boolean manager) {
+        return manager ? "left join module_records m on m.id=ft.source_entity_id and ft.source_entity_type='WALLET' " : "";
+    }
+
+    private String horseColumn(boolean manager) {
+        return manager ? "coalesce(ft.horse_id,m.horse_id)" : "ft.horse_id";
+    }
+
+    private String reportablePredicate(boolean manager) {
+        return manager
+                ? "(ft.source_entity_type is null or ft.source_entity_type<>'WALLET' "
+                  + "or ft.category in ('SERVICE_FEE','LATE_FEE'))"
+                : "(ft.source_entity_type is null or ft.source_entity_type<>'WALLET')";
+    }
+
+    private String reportType(boolean manager) {
+        return manager
+                ? "case when ft.source_entity_type='WALLET' and ft.category in ('SERVICE_FEE','LATE_FEE') "
+                  + "then 'REVENUE' else ft.transaction_type end"
+                : "ft.transaction_type";
     }
 
     private TransactionView map(java.sql.ResultSet rs, int row) throws java.sql.SQLException {
@@ -190,6 +235,8 @@ public class FinanceService {
             case "MEDICAL_COST" -> "Chi phí y tế & thú y";
             case "OPERATING_COST" -> "Chi phí vận hành";
             case "PRIZE_REVENUE" -> "Tiền thưởng giải đua";
+            case "SERVICE_FEE" -> "Phí gói dịch vụ";
+            case "LATE_FEE" -> "Phụ phí gia hạn trễ";
             default -> cat;
         };
     }
@@ -203,5 +250,6 @@ public class FinanceService {
                                   LocalDate transactionDate, String transactionType, String category,
                                   BigDecimal amount, String currency, String description, String sourceEntityType,
                                   UUID sourceEntityId, UUID recordedByUserId, OffsetDateTime createdAt) {}
-    public record SummaryView(String currency, BigDecimal expense, BigDecimal revenue, BigDecimal net) {}
+    public record SummaryView(String currency, BigDecimal expense, BigDecimal revenue, BigDecimal net,
+                              BigDecimal walletTopup) {}
 }

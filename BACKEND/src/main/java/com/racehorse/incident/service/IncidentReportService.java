@@ -8,6 +8,7 @@ import com.racehorse.common.exception.ResourceNotFoundException;
 import com.racehorse.horse.entity.Horse;
 import com.racehorse.horse.service.HorseAccessService;
 import com.racehorse.incident.dto.CreateIncidentReportRequest;
+import com.racehorse.incident.dto.CreateTrainingEmergencyRequest;
 import com.racehorse.incident.dto.IncidentReportResponse;
 import com.racehorse.incident.dto.UpdateIncidentStatusRequest;
 import com.racehorse.notification.entity.NotificationPriority;
@@ -83,7 +84,7 @@ public class IncidentReportService {
 
         jdbc.update(
                 "insert into module_records(id, module_code, record_type, horse_id, user_id, event_date, status, data_json, created_at, updated_at) " +
-                        "values (?, 'STABLE_CARE', 'INCIDENT_REPORT', ?, ?, ?, 'REPORTED', ?, SYSDATETIMEOFFSET(), SYSDATETIMEOFFSET())",
+                        "values (?, 'STABLE_CARE', 'INCIDENT_REPORT', ?, ?, ?, 'REPORTED', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
                 incidentId, horse.getId(), actorId, today, toJson(data));
 
         // Push immediate notification to Veterinarians and Head Trainers
@@ -93,34 +94,197 @@ public class IncidentReportService {
     }
 
     @Transactional
-    public IncidentReportResponse updateStatus(UUID incidentId, UUID actorId, UpdateIncidentStatusRequest request) {
-        IncidentReportResponse existing = getReport(incidentId);
-        String targetStatus = request.status().trim().toUpperCase(Locale.ROOT);
+    public IncidentReportResponse createTrainingEmergency(UUID trainerId, CreateTrainingEmergencyRequest request) {
+        record Session(UUID scheduleId, UUID horseId, String horseCode, String horseName, String taskName,
+                       UUID groundId, String groundName, UUID laneId, Integer laneNumber,
+                       LocalDate trainingDate, UUID caretakerId, UUID vetId) { }
+        List<Session> rows = jdbc.query("""
+                select s.id schedule_id,h.id horse_id,h.code horse_code,h.name horse_name,s.task_name,
+                       r.id ground_id,r.name ground_name,l.id lane_id,l.lane_number,
+                       cast(s.scheduled_start at time zone 'Asia/Ho_Chi_Minh' as date) training_date,
+                       h.caretaker_user_id,h.diagnosing_vet_user_id
+                from training_schedules s join horses h on h.id=s.horse_id
+                left join racetracks r on r.id=s.racetrack_id
+                left join trial_run_bookings b on b.training_schedule_id=s.id and b.cancelled_at is null
+                left join racetrack_lanes l on l.id=b.racetrack_lane_id
+                where s.id=? and h.current_trainer_id=? and h.archived_at is null
+                  and s.cancelled_at is null and s.session_status='IN_PROGRESS'
+                """, (rs, row) -> new Session(rs.getObject("schedule_id", UUID.class),
+                rs.getObject("horse_id", UUID.class), rs.getString("horse_code"), rs.getString("horse_name"),
+                rs.getString("task_name"),
+                rs.getObject("ground_id", UUID.class), rs.getString("ground_name"), rs.getObject("lane_id", UUID.class),
+                (Integer) rs.getObject("lane_number"), rs.getObject("training_date", LocalDate.class),
+                rs.getObject("caretaker_user_id", UUID.class), rs.getObject("diagnosing_vet_user_id", UUID.class)),
+                request.trainingScheduleId(), trainerId);
+        if (rows.isEmpty()) throw new ResourceNotFoundException("Không tìm thấy buổi tập đang huấn luyện của ngựa do bạn phụ trách");
+        Session session = rows.getFirst();
+        Map<String, UUID> selected = new LinkedHashMap<>();
+        if (request.recipients().contains(CreateTrainingEmergencyRequest.Recipient.CARETAKER)) {
+            if (session.caretakerId() == null) throw new BusinessException("Ngựa chưa được phân công nhân viên chuồng phụ trách");
+            selected.put("CARETAKER", session.caretakerId());
+        }
+        if (request.recipients().contains(CreateTrainingEmergencyRequest.Recipient.DIAGNOSING_VET)) {
+            if (session.vetId() == null) throw new BusinessException("Ngựa chưa được phân công bác sĩ chẩn đoán");
+            selected.put("DIAGNOSING_VET", session.vetId());
+        }
+        String description = request.description().trim();
+        String incidentType = "Khẩn cấp từ huấn luyện viên";
+        LocalDate today = LocalDate.now(clock);
+        OffsetDateTime now = OffsetDateTime.now(clock);
+        UUID incidentId = UUID.randomUUID();
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("incidentType", incidentType);
+        data.put("severity", "HIGH");
+        data.put("description", description);
+        data.put("photoUrl", null);
+        data.put("reportedByUserId", trainerId.toString());
+        data.put("reportedAt", now.toString());
+        data.put("trainingScheduleId", session.scheduleId().toString());
+        data.put("trainingTaskName", session.taskName());
+        data.put("groundId", session.groundId());
+        data.put("groundName", session.groundName());
+        data.put("laneId", session.laneId());
+        data.put("laneNumber", session.laneNumber());
+        data.put("recipients", selected.keySet());
+        data.put("resolvedByUserId", null); data.put("resolvedByName", null);
+        data.put("resolvedAt", null); data.put("resolutionNotes", null);
+        jdbc.update("insert into module_records(id,module_code,record_type,horse_id,user_id,event_date,status,data_json,created_at,updated_at) "
+                + "values(?,'STABLE_CARE','INCIDENT_REPORT',?, ?,?,'REPORTED',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                incidentId, session.horseId(), trainerId, session.trainingDate(), toJson(data));
+        int injuredSession = jdbc.update("update training_schedules set session_status='EMERGENCY_STOPPED', "
+                        + "updated_at=CURRENT_TIMESTAMP, version=version+1 where id=? and session_status='IN_PROGRESS'",
+                session.scheduleId());
+        if (injuredSession != 1)
+            throw new BusinessException("Buổi tập đã thay đổi trạng thái; hãy tải lại trước khi gửi khẩn cấp");
+        int injuredHorse = jdbc.update("update horses set status='INJURED',health_status='INJURED', "
+                        + "health_source_type='TRAINING_EMERGENCY',health_source_id=?,health_changed_by_user_id=?, "
+                        + "health_changed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,version=version+1 where id=?",
+                incidentId, trainerId, session.horseId());
+        if (injuredHorse != 1)
+            throw new BusinessException("Không thể cập nhật trạng thái chấn thương của ngựa");
+        Set<UUID> ownerIds = new HashSet<>(jdbc.query(
+                "select owner_id from horse_ownerships where horse_id=?",
+                (rs, row) -> rs.getObject("owner_id", UUID.class), session.horseId()));
+        Set<UUID> recipientIds = new HashSet<>(selected.values());
+        recipientIds.addAll(ownerIds);
+        // Any available veterinarian may be first to receive an emergency.
+        for (UserAccount vet : userRepository.findByRoles(List.of(Role.VETERINARIAN))) {
+            recipientIds.add(vet.getId());
+        }
+        for (UUID recipientId : recipientIds) {
+            UserAccount recipient = userRepository.findById(recipientId)
+                    .orElseThrow(() -> new BusinessException("Người nhận khẩn cấp không còn hoạt động"));
+            notificationService.create(recipient, "TRAINING_EMERGENCY", NotificationPriority.HIGH,
+                    "Khẩn cấp trong buổi huấn luyện", session.horseCode() + " - " + description,
+                    "INCIDENT_REPORT", incidentId);
+        }
+        return getReport(incidentId);
+    }
 
-        if (!List.of("REPORTED", "UNDER_REVIEW", "RESOLVED").contains(targetStatus)) {
+    @Transactional(readOnly = true)
+    public List<IncidentReportResponse> sentTrainingEmergencies(UUID trainerId) {
+        return jdbc.query(baseSelect() + " where m.module_code='STABLE_CARE' and m.record_type='INCIDENT_REPORT' "
+                + "and m.user_id=? and dbo.json_value(m.data_json,'$.trainingScheduleId') is not null "
+                + "order by m.created_at desc", (rs, row) -> mapResponse(rs), trainerId);
+    }
+
+    @Transactional(readOnly = true)
+    public List<IncidentReportResponse> ownerTrainingEmergencies(UUID horseId, UUID ownerId) {
+        horseAccess.requireOwned(horseId, ownerId);
+        return jdbc.query(baseSelect() + " where m.module_code='STABLE_CARE' and m.record_type='INCIDENT_REPORT' "
+                + "and m.horse_id=? and dbo.json_value(m.data_json,'$.trainingScheduleId') is not null "
+                + "order by m.created_at desc", (rs, row) -> mapResponse(rs), horseId);
+    }
+
+    @Transactional(readOnly = true)
+    public IncidentReportResponse trainingEmergency(UUID incidentId, UUID userId, boolean owner) {
+        IncidentReportResponse response = getReport(incidentId);
+        if (response.trainingScheduleId() == null) throw new ResourceNotFoundException("Không tìm thấy yêu cầu khẩn cấp");
+        if (owner) horseAccess.requireOwned(response.horseId(), userId);
+        else if (!userId.equals(response.reportedByUserId()))
+            throw new ResourceNotFoundException("Không tìm thấy yêu cầu khẩn cấp của bạn");
+        return response;
+    }
+
+    @Transactional
+    public IncidentReportResponse updateStatus(UUID incidentId, UUID actorId,
+            UpdateIncidentStatusRequest request, boolean managerOrVet) {
+        IncidentReportResponse existing = getReport(incidentId);
+        if (!managerOrVet && !actorId.equals(existing.reportedByUserId())) {
+            throw new BusinessException("Chỉ nhân viên gửi báo cáo mới được cập nhật sự cố này");
+        }
+        String targetStatus = request.status().trim().toUpperCase(Locale.ROOT);
+        if ("ACKNOWLEDGED".equals(targetStatus)
+                && ("HIGH".equals(existing.severity()) || "CRITICAL".equals(existing.severity()))
+                && existing.emergencyVetId() == null) {
+            throw new BusinessException("Ca khẩn cấp phải được bác sĩ thú y tiếp nhận qua chức năng Nhận cấp cứu");
+        }
+
+        if (!List.of("REPORTED", "UNDER_REVIEW", "ACKNOWLEDGED", "RESOLVED", "DISMISSED").contains(targetStatus)) {
             throw new BusinessException("Trạng thái sự cố không hợp lệ: " + targetStatus);
         }
 
         String currentJson = jdbc.queryForObject(
                 "select data_json from module_records where id=?", String.class, incidentId);
         Map<String, Object> data = readMap(currentJson);
+        Object emergencyVet = data.get("emergencyVetId");
+        if (emergencyVet != null && !actorId.toString().equalsIgnoreCase(String.valueOf(emergencyVet))) {
+            throw new BusinessException("Ca cấp cứu đã được bác sĩ khác tiếp nhận; không thể đổi trạng thái");
+        }
 
-        if ("RESOLVED".equals(targetStatus)) {
-            List<String> names = jdbc.query(
-                    "select username from users where id=?",
-                    (rs, rn) -> rs.getString("username"), actorId);
-            String resolverName = names.isEmpty() ? "Người xử lý" : names.getFirst();
+        List<String> names = jdbc.query(
+                "select username from users where id=?",
+                (rs, rn) -> rs.getString("username"), actorId);
+        String actorName = names.isEmpty() ? "Người xử lý" : names.getFirst();
 
+        if ("RESOLVED".equals(targetStatus) || "DISMISSED".equals(targetStatus)) {
             data.put("resolvedByUserId", actorId.toString());
-            data.put("resolvedByName", resolverName);
+            data.put("resolvedByName", actorName);
             data.put("resolvedAt", OffsetDateTime.now(clock).toString());
             data.put("resolutionNotes", request.resolutionNotes() == null ? null : request.resolutionNotes().trim());
+        } else if ("ACKNOWLEDGED".equals(targetStatus)) {
+            data.put("acknowledgedByUserId", actorId.toString());
+            data.put("acknowledgedByName", actorName);
+            data.put("acknowledgedAt", OffsetDateTime.now(clock).toString());
+            data.put("acknowledgementNotes", request.resolutionNotes() == null ? null : request.resolutionNotes().trim());
         }
 
         jdbc.update(
-                "update module_records set status=?, data_json=?, updated_at=SYSDATETIMEOFFSET() where id=?",
+                "update module_records set status=?, data_json=?, updated_at=CURRENT_TIMESTAMP where id=?",
                 targetStatus, toJson(data), incidentId);
 
+        return getReport(incidentId);
+    }
+
+    @Transactional
+    public IncidentReportResponse claimEmergency(UUID incidentId, UUID veterinarianId) {
+        IncidentReportResponse report = getReport(incidentId);
+        if (!List.of("HIGH", "CRITICAL").contains(report.severity())) {
+            throw new BusinessException("Chỉ sự cố mức cao hoặc nguy kịch được tiếp nhận như ca cấp cứu");
+        }
+        jdbc.queryForObject("select id from horses where id=? for update", UUID.class, report.horseId());
+        Integer otherClaim = jdbc.queryForObject("""
+                select count(*) from module_records where horse_id=? and module_code='STABLE_CARE'
+                  and record_type='INCIDENT_REPORT' and status='ACKNOWLEDGED'
+                  and dbo.json_value(data_json,'$.emergencyVetId') is not null
+                  and dbo.json_value(data_json,'$.emergencyExaminationId') is null
+                """, Integer.class, report.horseId());
+        if (otherClaim != null && otherClaim > 0) {
+            throw new BusinessException("Ngựa đang có ca cấp cứu do bác sĩ khác tiếp nhận");
+        }
+        List<String> names = jdbc.query("select username from users where id=?",
+                (rs, row) -> rs.getString(1), veterinarianId);
+        if (names.isEmpty()) throw new ResourceNotFoundException("Không tìm thấy bác sĩ tiếp nhận");
+        int changed = jdbc.update("""
+                update module_records set status='ACKNOWLEDGED',
+                    data_json=dbo.json_modify(dbo.json_modify(dbo.json_modify(data_json,'$.emergencyVetId',cast(? as varchar(36))),
+                                              '$.emergencyVetName',?),
+                                              '$.emergencyClaimedAt',to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')),
+                    updated_at=CURRENT_TIMESTAMP
+                where id=? and horse_id=? and module_code='STABLE_CARE' and record_type='INCIDENT_REPORT'
+                  and status='REPORTED' and dbo.json_value(data_json,'$.severity') in ('HIGH','CRITICAL')
+                """, veterinarianId, names.getFirst(), incidentId, report.horseId());
+        if (changed != 1) throw new BusinessException("Ca cấp cứu đã được bác sĩ khác tiếp nhận hoặc không còn mở");
         return getReport(incidentId);
     }
 
@@ -150,7 +314,7 @@ public class IncidentReportService {
             args.add(status.trim().toUpperCase(Locale.ROOT));
         }
         if (severity != null && !severity.isBlank()) {
-            sql.append(" and JSON_VALUE(m.data_json,'$.severity')=?");
+            sql.append(" and dbo.json_value(m.data_json,'$.severity')=?");
             args.add(severity.trim().toUpperCase(Locale.ROOT));
         }
         if (fromDate != null) {
@@ -244,7 +408,15 @@ public class IncidentReportService {
                 resolvedByUserId,
                 resolvedByName,
                 resolvedAt,
-                resolutionNotes);
+                resolutionNotes,
+                node.path("trainingScheduleId").isMissingNode() ? null : UUID.fromString(node.path("trainingScheduleId").asText()),
+                node.path("trainingTaskName").asText(null), node.path("groundName").asText(null),
+                node.path("laneNumber").isNumber() ? node.path("laneNumber").asInt() : null,
+                node.path("recipients").isArray() ? java.util.stream.StreamSupport.stream(node.path("recipients").spliterator(), false)
+                        .map(JsonNode::asText).toList() : List.of(),
+                node.hasNonNull("emergencyVetId") ? UUID.fromString(node.path("emergencyVetId").asText()) : null,
+                node.path("emergencyVetName").asText(null),
+                node.hasNonNull("emergencyExaminationId") ? UUID.fromString(node.path("emergencyExaminationId").asText()) : null);
     }
 
     private JsonNode read(String raw) {

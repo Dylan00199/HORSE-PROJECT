@@ -1,10 +1,27 @@
 # Racehorse Club Frontend
 
-Giao diện React/Vite tạm thời để kiểm thử các API backend đã triển khai.
+Giao diện React/Vite. Bản Vercel gọi API trên Render; backend Render dùng chung
+PostgreSQL Supabase cho cả nhóm.
+
+## Cấu hình Vercel
+
+Đặt `VITE_API_URL=https://horse-project-4qa4.onrender.com` trong Vercel →
+Project → Settings → Environment Variables, rồi redeploy frontend. Biến Vite
+được đóng vào JavaScript khi build, nên thay đổi biến mà không redeploy sẽ không
+cập nhật trang đang phát hành. Không đưa mật khẩu database, JWT secret hoặc
+khóa Cloudinary vào biến `VITE_*`.
+
+Trang Vercel chính cũng có URL Render mặc định nếu chưa đặt `VITE_API_URL`.
+Bản production luôn ưu tiên cấu hình Vercel/Render và bỏ qua URL tùy chỉnh cũ
+trong localStorage, nhờ đó không thể gọi nhầm `127.0.0.1` trên máy người xem.
+Chỉ frontend chạy tại `localhost` mới hiển thị chức năng đổi URL API.
+
+Khi chạy frontend tại `localhost` mà không đặt `VITE_API_URL`, API mặc định
+là `http://127.0.0.1:8080`.
 
 ## Chạy dự án
 
-Backend phải chạy tại `http://localhost:8080`, sau đó:
+Backend phải chạy tại `http://127.0.0.1:8080`, sau đó:
 
 ```bash
 cd FRONTEND

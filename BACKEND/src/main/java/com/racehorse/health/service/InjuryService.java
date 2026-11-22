@@ -46,12 +46,21 @@ public class InjuryService {
                 ? req.attachmentFileIds().stream().map(UUID::toString).toList()
                 : List.of();
 
+        String effectiveBodyLocation = req.bodyLocation() != null && !req.bodyLocation().isBlank()
+                ? req.bodyLocation().trim()
+                : (req.bodyRegions() != null && !req.bodyRegions().isEmpty() ? String.join(", ", req.bodyRegions()) : "OTHER");
+        Double x = req.x();
+        Double y = req.y();
+        Double z = req.z();
+
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("examinationId", req.examinationId() != null ? req.examinationId().toString() : null);
-        data.put("bodyLocation", req.bodyLocation().trim());
-        data.put("x", req.x());
-        data.put("y", req.y());
-        data.put("z", req.z());
+        data.put("bodyLocation", effectiveBodyLocation);
+        data.put("bodyRegions", req.bodyRegions() != null ? req.bodyRegions() : List.of());
+        data.put("additionalNotes", trimToNull(req.additionalNotes()));
+        data.put("x", x);
+        data.put("y", y);
+        data.put("z", z);
         data.put("severity", severity);
         data.put("currentStatus", initialStatus);
         data.put("notes", trimToNull(req.notes()));
@@ -65,7 +74,7 @@ public class InjuryService {
                     created_at, updated_at
                 ) values (?, 'MEDICAL', 'INJURY_MARKER', 'injury_markers',
                           ?, ?, ?, ?, ?,
-                          SYSDATETIMEOFFSET(), SYSDATETIMEOFFSET())
+                          CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """,
                 injuryId, horseId, veterinarianId, initialStatus, today, toJson(data));
 
@@ -84,9 +93,26 @@ public class InjuryService {
                     created_at, updated_at
                 ) values (?, 'MEDICAL', 'INJURY_RECOVERY_UPDATE', 'injury_recovery_updates',
                           ?, ?, ?, ?, ?,
-                          SYSDATETIMEOFFSET(), SYSDATETIMEOFFSET())
+                          CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """,
                 updateId, horseId, veterinarianId, initialStatus, today, toJson(updateData));
+
+        if (!"HEALED".equals(initialStatus)) {
+            // A recorded active injury must immediately prevent training, even when
+            // the marker is created outside a medical examination.
+            jdbc.queryForObject("select id from horses where id=? for update", UUID.class, horseId);
+            jdbc.update("""
+                    update horses set health_status=case when health_status='QUARANTINED' then health_status else 'INJURED' end,
+                        health_changed_by_user_id=?, health_source_type='INJURY_MARKER', health_source_id=?,
+                        health_changed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP, version=version+1
+                    where id=?
+                    """, veterinarianId, injuryId, horseId);
+            jdbc.update("""
+                    insert into training_locks(id,horse_id,reason,review_date,locked_by_user_id,locked_at)
+                    select ?,?, ?,null,?,CURRENT_TIMESTAMP
+                    where not exists (select 1 from training_locks where horse_id=? and released_at is null)
+                    """, UUID.randomUUID(), horseId, "Tự động khóa: Chấn thương mới", veterinarianId, horseId);
+        }
 
         String vetName = findUsername(veterinarianId);
         OffsetDateTime now = OffsetDateTime.now();
@@ -95,10 +121,12 @@ public class InjuryService {
                 injuryId,
                 horseId,
                 req.examinationId(),
-                req.bodyLocation().trim(),
-                req.x(),
-                req.y(),
-                req.z(),
+                effectiveBodyLocation,
+                req.bodyRegions() != null ? req.bodyRegions() : List.of(),
+                trimToNull(req.additionalNotes()),
+                x,
+                y,
+                z,
                 severity,
                 initialStatus,
                 trimToNull(req.notes()),
@@ -125,7 +153,7 @@ public class InjuryService {
             throw new ResourceNotFoundException("Không tìm thấy dấu chấn thương: " + injuryId);
         }
 
-        UUID horseId = (UUID) rows.getFirst().get("horse_id");
+        UUID horseId = toUuid(rows.getFirst().get("horse_id"));
         horseAccessService.requireActive(horseId);
 
         String newStatus = normalizeRecoveryStatus(req.recoveryStatus());
@@ -149,7 +177,7 @@ public class InjuryService {
                     created_at, updated_at
                 ) values (?, 'MEDICAL', 'INJURY_RECOVERY_UPDATE', 'injury_recovery_updates',
                           ?, ?, ?, ?, ?,
-                          SYSDATETIMEOFFSET(), SYSDATETIMEOFFSET())
+                          CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """,
                 updateId, horseId, veterinarianId, newStatus, today, toJson(updateData));
 
@@ -157,11 +185,12 @@ public class InjuryService {
         jdbc.update("""
                 update module_records
                 set status = ?,
-                    data_json = JSON_MODIFY(data_json, '$.currentStatus', ?),
-                    updated_at = SYSDATETIMEOFFSET()
+                    data_json = dbo.json_modify(data_json, '$.currentStatus', ?),
+                    updated_at = CURRENT_TIMESTAMP
                 where id = ?
                 """,
                 newStatus, newStatus, injuryId);
+        reconcileInjuryTrainingState(horseId, veterinarianId);
 
         String vetName = findUsername(veterinarianId);
         OffsetDateTime now = OffsetDateTime.now();
@@ -200,9 +229,11 @@ public class InjuryService {
             String examIdStr = node.path("examinationId").isNull() ? null : node.path("examinationId").asText(null);
             UUID examId = examIdStr != null && !examIdStr.isBlank() ? UUID.fromString(examIdStr) : null;
             String bodyLocation = node.path("bodyLocation").asText("");
-            Double x = node.path("x").asDouble();
-            Double y = node.path("y").asDouble();
-            Double z = node.path("z").asDouble();
+            List<String> bodyRegions = parseStringList(node.path("bodyRegions"));
+            String additionalNotes = node.path("additionalNotes").isNull() ? null : node.path("additionalNotes").asText(null);
+            Double x = node.hasNonNull("x") ? node.path("x").asDouble() : null;
+            Double y = node.hasNonNull("y") ? node.path("y").asDouble() : null;
+            Double z = node.hasNonNull("z") ? node.path("z").asDouble() : null;
             String severity = node.path("severity").asText("");
             String currentStatus = node.path("currentStatus").asText("");
             String notes = node.path("notes").isNull() ? null : node.path("notes").asText(null);
@@ -211,6 +242,7 @@ public class InjuryService {
 
             return new InjuryDetailResponse(
                     id, horseId, horseCode, horseName, examId, bodyLocation,
+                    bodyRegions, additionalNotes,
                     x, y, z, severity, currentStatus, notes, attachmentFileIds,
                     vetId, vetName, createdAt, updatedAt, List.of());
         }, injuryId);
@@ -228,7 +260,7 @@ public class InjuryService {
                 from module_records u
                 join users usr on usr.id = u.user_id
                 where u.module_code = 'MEDICAL' and u.record_type = 'INJURY_RECOVERY_UPDATE'
-                  and JSON_VALUE(u.data_json, '$.injuryMarkerId') = ?
+                  and dbo.json_value(u.data_json, '$.injuryMarkerId') = ?
                 order by u.created_at asc
                 """, (rs, rowNum) -> {
             UUID id = rs.getObject("id", UUID.class);
@@ -248,6 +280,7 @@ public class InjuryService {
         return new InjuryDetailResponse(
                 detail.id(), detail.horseId(), detail.horseCode(), detail.horseName(),
                 detail.examinationId(), detail.bodyLocation(),
+                detail.bodyRegions(), detail.additionalNotes(),
                 detail.x(), detail.y(), detail.z(),
                 detail.severity(), detail.currentStatus(), detail.initialNotes(),
                 detail.attachmentFileIds(), detail.recordedByUserId(),
@@ -274,14 +307,14 @@ public class InjuryService {
                        (select count(*)
                         from module_records u
                         where u.module_code = 'MEDICAL' and u.record_type = 'INJURY_RECOVERY_UPDATE'
-                          and JSON_VALUE(u.data_json, '$.injuryMarkerId') = cast(m.id as varchar(36))
+                          and dbo.json_value(u.data_json, '$.injuryMarkerId') = cast(m.id as varchar(36))
                        ) as update_count
                 from module_records m
                 join users usr on usr.id = m.user_id
                 where m.module_code = 'MEDICAL' and m.record_type = 'INJURY_MARKER'
                   and m.horse_id = ?
                 """
-                + (normalizedStatus != null ? " and JSON_VALUE(m.data_json, '$.currentStatus') = ? " : "")
+                + (normalizedStatus != null ? " and dbo.json_value(m.data_json, '$.currentStatus') = ? " : "")
                 + " order by m.created_at desc";
 
         List<Object> args = new ArrayList<>();
@@ -302,9 +335,11 @@ public class InjuryService {
             String examIdStr = node.path("examinationId").isNull() ? null : node.path("examinationId").asText(null);
             UUID examId = examIdStr != null && !examIdStr.isBlank() ? UUID.fromString(examIdStr) : null;
             String bodyLocation = node.path("bodyLocation").asText("");
-            Double x = node.path("x").asDouble();
-            Double y = node.path("y").asDouble();
-            Double z = node.path("z").asDouble();
+            List<String> bodyRegions = parseStringList(node.path("bodyRegions"));
+            String additionalNotes = node.path("additionalNotes").isNull() ? null : node.path("additionalNotes").asText(null);
+            Double x = node.hasNonNull("x") ? node.path("x").asDouble() : null;
+            Double y = node.hasNonNull("y") ? node.path("y").asDouble() : null;
+            Double z = node.hasNonNull("z") ? node.path("z").asDouble() : null;
             String severity = node.path("severity").asText("");
             String currentStatus = node.path("currentStatus").asText("");
             String notes = node.path("notes").isNull() ? null : node.path("notes").asText(null);
@@ -312,6 +347,7 @@ public class InjuryService {
 
             return new InjuryResponse(
                     id, horseId, examId, bodyLocation,
+                    bodyRegions, additionalNotes,
                     x, y, z, severity, currentStatus, notes,
                     attachmentFileIds, vetId, vetName,
                     createdAt, updatedAt, updateCount);
@@ -352,6 +388,78 @@ public class InjuryService {
         return list;
     }
 
+    private List<String> parseStringList(JsonNode node) {
+        if (node == null || !node.isArray()) return List.of();
+        List<String> list = new ArrayList<>();
+        for (JsonNode item : node) {
+            String text = item.asText(null);
+            if (text != null && !text.isBlank()) {
+                list.add(text.trim());
+            }
+        }
+        return list;
+    }
+
+    @Transactional
+    public void delete(UUID injuryId, UUID actorId) {
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "select horse_id from module_records where id=? and module_code='MEDICAL' and record_type in ('INJURY_MARKER', 'INJURY')",
+                injuryId);
+        if (rows.isEmpty()) {
+            throw new ResourceNotFoundException("Không tìm thấy thông tin chấn thương: " + injuryId);
+        }
+        UUID horseId = toUuid(rows.getFirst().get("horse_id"));
+        if (horseId != null) {
+            horseAccessService.requireActive(horseId);
+        }
+        // Delete recovery updates of this injury
+        jdbc.update("""
+                delete from module_records
+                where module_code='MEDICAL' and record_type='INJURY_RECOVERY_UPDATE'
+                  and (dbo.json_value(data_json, '$.injuryMarkerId')=? or dbo.json_value(data_json, '$.injuryId')=? or data_json like ?)
+                """, injuryId.toString(), injuryId.toString(), "%" + injuryId + "%");
+        // Delete injury record
+        jdbc.update("delete from module_records where id=? and module_code='MEDICAL' and record_type in ('INJURY_MARKER', 'INJURY')", injuryId);
+        reconcileInjuryTrainingState(horseId, actorId);
+    }
+
+    private void reconcileInjuryTrainingState(UUID horseId, UUID actorId) {
+        if (horseId == null) return;
+        jdbc.queryForObject("select id from horses where id=? for update", UUID.class, horseId);
+        Integer activeInjuries = jdbc.queryForObject(
+                "select count(*) from module_records where horse_id=? and module_code='MEDICAL' "
+                        + "and record_type in ('INJURY_MARKER','INJURY') and status not in ('HEALED','RESOLVED')",
+                Integer.class, horseId);
+        if (activeInjuries != null && activeInjuries > 0) {
+            jdbc.update("""
+                    update horses set health_status='INJURED', health_changed_by_user_id=?,
+                        health_source_type='INJURY_MARKER', health_changed_at=CURRENT_TIMESTAMP,
+                        updated_at=CURRENT_TIMESTAMP, version=version+1
+                    where id=? and health_status='FIT'
+                    """, actorId, horseId);
+            jdbc.update("""
+                    insert into training_locks(id,horse_id,reason,review_date,locked_by_user_id,locked_at)
+                    select ?,?,'Tự động khóa: Chấn thương đang theo dõi',null,?,CURRENT_TIMESTAMP
+                    where not exists (select 1 from training_locks where horse_id=? and released_at is null)
+                    """, UUID.randomUUID(), horseId, actorId, horseId);
+            return;
+        }
+
+        jdbc.update("""
+                update horses set health_status='FIT', health_changed_by_user_id=?,
+                    health_source_type=null, health_source_id=null,
+                    health_changed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP, version=version+1
+                where id=? and health_source_type='INJURY_MARKER'
+                """, actorId, horseId);
+        jdbc.update("""
+                update training_locks set released_at=CURRENT_TIMESTAMP, released_by_user_id=?,
+                    release_reason='Tự động gỡ khóa: Không còn chấn thương hoạt động'
+                where horse_id=? and released_at is null
+                  and (reason like 'Tự động khóa:%' or reason like 'Khóa tự động từ kết quả khám:%')
+                  and exists (select 1 from horses where id=? and health_status='FIT')
+                """, actorId, horseId, horseId);
+    }
+
     private String findUsername(UUID userId) {
         List<String> names = jdbc.query("select username from users where id = ?",
                 (rs, rowNum) -> rs.getString(1), userId);
@@ -376,5 +484,10 @@ public class InjuryService {
 
     private String trimToNull(String value) {
         return value == null || value.isBlank() ? null : value.trim();
+    }
+
+    private UUID toUuid(Object value) {
+        if (value == null) return null;
+        return value instanceof UUID uuid ? uuid : UUID.fromString(value.toString());
     }
 }

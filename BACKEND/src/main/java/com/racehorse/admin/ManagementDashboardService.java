@@ -18,7 +18,7 @@ public class ManagementDashboardService {
         return Map.of("month",current.toString(),"compareTo",previous.toString(),"currency","VND",
                 "current",metrics(current),"previous",metrics(previous),
                 "activeHorses",jdbc.queryForObject("select count(*) from horses where archived_at is null",Integer.class),
-                "activeAccounts",jdbc.queryForObject("select count(*) from users where enabled=1",Integer.class));
+                "activeAccounts",jdbc.queryForObject("select count(*) from users where cast(enabled as varchar(5)) in ('1', 'true', 't')",Integer.class));
     }
     private YearMonth parseMonth(String value){try{YearMonth m=YearMonth.parse(value);if(m.getYear()<2000||m.getYear()>2100)throw new IllegalArgumentException();return m;}catch(Exception e){throw new BusinessException("Tháng phải có dạng YYYY-MM, trong khoảng 2000–2100");}}
     private Map<String,Object> metrics(YearMonth month){
@@ -29,11 +29,19 @@ public class ManagementDashboardService {
         for(String status:List.of("GREEN","YELLOW","RED"))result.put(status.toLowerCase(Locale.ROOT),jdbc.queryForObject("select count(*) from training_evaluations where session_date>=? and session_date<? and fitness_status=?",Integer.class,start,end,status));
         BigDecimal expense=amount(start,end,"EXPENSE",null),revenue=amount(start,end,"REVENUE",null);
         result.put("expense",expense);result.put("revenue",revenue);result.put("net",revenue.subtract(expense));
+        result.put("walletTopup",jdbc.queryForObject("select coalesce(sum(amount),0) from financial_transactions "
+                + "where currency='VND' and source_entity_type='WALLET' and category='WALLET_TOPUP' "
+                + "and transaction_date>=? and transaction_date<?",BigDecimal.class,start,end));
         result.put("feedCost",amount(start,end,"EXPENSE","FEED_COST"));result.put("medicalCost",amount(start,end,"EXPENSE","MEDICAL_COST"));result.put("operatingCost",amount(start,end,"EXPENSE","OPERATING_COST"));result.put("prizeRevenue",amount(start,end,"REVENUE","PRIZE_REVENUE"));
         return result;
     }
     private BigDecimal amount(LocalDate start,LocalDate end,String type,String category){
-        String sql="select coalesce(sum(amount),0) from financial_transactions where currency='VND' and transaction_date>=? and transaction_date<? and transaction_type=?";
+        String sql="select coalesce(sum(amount),0) from financial_transactions where currency='VND' "
+                + "and transaction_date>=? and transaction_date<? and "
+                + "((source_entity_type is null or source_entity_type<>'WALLET') and transaction_type=?";
+        if ("REVENUE".equals(type) && category == null)
+            sql += " or (source_entity_type='WALLET' and category in ('SERVICE_FEE','LATE_FEE'))";
+        sql += ")";
         return category==null?jdbc.queryForObject(sql,BigDecimal.class,start,end,type):jdbc.queryForObject(sql+" and category=?",BigDecimal.class,start,end,type,category);
     }
 }

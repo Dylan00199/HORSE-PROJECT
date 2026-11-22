@@ -54,12 +54,13 @@ public class BarnHealthService {
                     true, lockId, reason, reviewDate, lockedAt));
         });
 
-        // 2. Fetch all active horses
+        // 2. Fetch all active horses (including active profile photo)
         Map<UUID, BarnHealthMapResponse.HorseView> horsesById = new HashMap<>();
         jdbc.query("""
-                select id, code, name, gender, health_status, stable_location
-                from horses
-                where archived_at is null
+                select h.id, h.code, h.name, h.gender, h.health_status, h.stable_location,
+                       (select hpf.secure_url from horse_profile_files hpf where hpf.horse_id = h.id and hpf.status = 'ACTIVE' and hpf.content_type like 'image/%' order by hpf.created_at desc limit 1) as photo_url
+                from horses h
+                where h.archived_at is null
                 """, rs -> {
             UUID id = rs.getObject("id", UUID.class);
             String code = rs.getString("code");
@@ -67,13 +68,14 @@ public class BarnHealthService {
             String gender = rs.getString("gender");
             String healthStatus = rs.getString("health_status");
             if (healthStatus == null || healthStatus.isBlank()) {
-                healthStatus = "FIT";
+                healthStatus = "UNKNOWN";
             }
             String stableLocation = rs.getString("stable_location");
+            String photoUrl = rs.getString("photo_url");
             BarnHealthMapResponse.TrainingLockView lockView = activeLocks.get(id);
 
             horsesById.put(id, new BarnHealthMapResponse.HorseView(
-                    id, code, name, gender, healthStatus, stableLocation, lockView));
+                    id, code, name, gender, healthStatus, stableLocation, lockView, photoUrl));
         });
 
         // 3. Fetch active stall assignments: stallId -> horseId
@@ -97,7 +99,7 @@ public class BarnHealthService {
                 select id, status, data_json
                 from module_records
                 where module_code='STABLE_CARE' and record_type='STALL'
-                order by JSON_VALUE(data_json,'$.stallCode')
+                order by dbo.json_value(data_json,'$.stallCode')
                 """, rs -> {
             UUID stallId = rs.getObject("id", UUID.class);
             boolean active = "ACTIVE".equalsIgnoreCase(rs.getString("status"));
@@ -114,7 +116,7 @@ public class BarnHealthService {
         });
 
         // 5. Fetch stables
-        String stableSql = "select id, name, location, is_active from stables where is_active=1 "
+        String stableSql = "select id, name, location, is_active from stables where is_active=true "
                 + (stableFilter != null ? "and id=? " : "")
                 + "order by name";
         List<BarnHealthMapResponse.StableView> stablesList = new ArrayList<>();
@@ -160,7 +162,7 @@ public class BarnHealthService {
                     case "MONITOR" -> monitorCount++;
                     case "INJURED" -> injuredCount++;
                     case "QUARANTINED" -> quarantinedCount++;
-                    default -> fitCount++;
+                    default -> { /* Unknown or legacy status must not be reported as FIT. */ }
                 }
                 if (h.trainingLock() != null && h.trainingLock().isLocked()) {
                     lockedCount++;

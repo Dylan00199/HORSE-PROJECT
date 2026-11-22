@@ -17,37 +17,73 @@ import java.util.UUID;
 
 @Service
 public class RolePermissionService {
-    private static final Map<String, Set<String>> SUPPORTED_ACTIONS = Map.of(
-            "PROFILE", Set.of("VIEW", "EDIT", "APPROVE"),
-            "TRAINING", Set.of("VIEW", "EDIT"),
-            "MEDICAL", Set.of("VIEW", "EDIT"),
-            "STABLE_CARE", Set.of("VIEW", "EDIT"),
-            "RACING", Set.of("VIEW", "EDIT", "APPROVE"),
-            "REPORTING", Set.of("VIEW", "EDIT"));
+    // Only expose permissions checked by an API that the role can actually use.
+    private static final Map<Role, Map<String, Set<String>>> SUPPORTED_ACTIONS = Map.of(
+            Role.CLUB_MANAGER, Map.of(
+                    "PROFILE", Set.of("VIEW", "EDIT", "APPROVE"), "TRAINING", Set.of("VIEW", "EDIT"),
+                    "MEDICAL", Set.of("VIEW", "EDIT"), "STABLE_CARE", Set.of("VIEW", "EDIT"),
+                    "REPORTING", Set.of("VIEW", "EDIT"), "INVENTORY", Set.of("VIEW", "EDIT", "APPROVE", "CLAIM")),
+            Role.HEAD_TRAINER, Map.of(
+                    "PROFILE", Set.of("VIEW"), "TRAINING", Set.of("VIEW", "EDIT"),
+                    "STABLE_CARE", Set.of("VIEW", "EDIT"), "REPORTING", Set.of("VIEW"),
+                    "INVENTORY", Set.of("VIEW")),
+            Role.VETERINARIAN, Map.of(
+                    "PROFILE", Set.of("VIEW"), "TRAINING", Set.of("VIEW"),
+                    "MEDICAL", Set.of("VIEW", "EDIT"), "STABLE_CARE", Set.of("VIEW", "EDIT")),
+            Role.STABLE_STAFF, Map.of(
+                    "PROFILE", Set.of("VIEW"), "TRAINING", Set.of("VIEW", "EDIT"),
+                    "STABLE_CARE", Set.of("VIEW", "EDIT"), "INVENTORY", Set.of("VIEW", "EDIT", "CLAIM")),
+            Role.HORSE_OWNER, Map.of(
+                    "PROFILE", Set.of("VIEW"), "TRAINING", Set.of("VIEW"),
+                    "MEDICAL", Set.of("VIEW"), "STABLE_CARE", Set.of("VIEW"),
+                    "REPORTING", Set.of("VIEW")));
     private final JdbcTemplate jdbc;
 
     public RolePermissionService(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+
+    public static List<String> managerPermissions() {
+        return java.util.stream.Stream.of("PROFILE", "TRAINING", "MEDICAL", "STABLE_CARE", "REPORTING", "INVENTORY", "SYSTEM")
+                .flatMap(module -> java.util.stream.Stream.of("VIEW", "EDIT", "APPROVE", "CLAIM")
+                        .map(action -> "PERM_" + module + "_" + action))
+                .toList();
+    }
+
+    public static boolean supports(Role role, String permissionCode) {
+        if (role == Role.CLUB_MANAGER) return managerPermissions().contains(permissionCode);
+        if (permissionCode == null || !permissionCode.startsWith("PERM_")) return false;
+        String value = permissionCode.substring(5);
+        int separator = value.lastIndexOf('_');
+        return separator > 0 && SUPPORTED_ACTIONS.getOrDefault(role, Map.of())
+                .getOrDefault(value.substring(0, separator), Set.of())
+                .contains(value.substring(separator + 1));
+    }
 
     @Transactional(readOnly = true)
     public List<RolePermissionResponse> matrix() {
         return jdbc.query("""
                 with roles(code) as (
                     select code from (values ('CLUB_MANAGER'),('HEAD_TRAINER'),('VETERINARIAN'),('STABLE_STAFF'),('HORSE_OWNER')) r(code)
+                ), modules(module_code) as (
+                    select m from (values ('PROFILE'),('TRAINING'),('MEDICAL'),('STABLE_CARE'),('REPORTING'),('INVENTORY'),('SYSTEM')) m(m)
+                ), actions(action_code) as (
+                    select a from (values ('VIEW'),('EDIT'),('APPROVE'),('CLAIM')) a(a)
                 ), permissions(module_code,action_code) as (
-                    select * from (values
-                        ('PROFILE','VIEW'),('PROFILE','EDIT'),('PROFILE','APPROVE'),
-                        ('TRAINING','VIEW'),('TRAINING','EDIT'),
-                        ('MEDICAL','VIEW'),('MEDICAL','EDIT'),
-                        ('STABLE_CARE','VIEW'),('STABLE_CARE','EDIT'),
-                        ('RACING','VIEW'),('RACING','EDIT'),('RACING','APPROVE'),
-                        ('REPORTING','VIEW'),('REPORTING','EDIT')) p(module_code,action_code)
+                    select module_code, action_code from modules cross join actions
                 )
-                select r.code,p.module_code,p.action_code,coalesce(rp.granted,0)
+                select r.code,p.module_code,p.action_code,rp.granted
                 from roles r cross join permissions p
                 left join role_permissions rp on rp.role_code=r.code
                     and rp.module_code=p.module_code and rp.action_code=p.action_code
                 order by r.code,p.module_code,p.action_code
-                """, (rs, row) -> new RolePermissionResponse(rs.getString(1), rs.getString(2), rs.getString(3), rs.getBoolean(4)));
+                """, (rs, row) -> new RolePermissionResponse(rs.getString(1), rs.getString(2), rs.getString(3), rs.getBoolean(4)))
+                .stream().filter(item -> {
+                    try {
+                        return SUPPORTED_ACTIONS.getOrDefault(Role.valueOf(item.role()), Map.of())
+                                .getOrDefault(item.module(), Set.of()).contains(item.action());
+                    } catch (IllegalArgumentException ignored) {
+                        return false;
+                    }
+                }).toList();
     }
 
     @Transactional
@@ -57,19 +93,21 @@ public class RolePermissionService {
         }
         String module = request.module().trim().toUpperCase(Locale.ROOT);
         String action = request.action().trim().toUpperCase(Locale.ROOT);
-        if (!SUPPORTED_ACTIONS.getOrDefault(module, Set.of()).contains(action)) {
+        if (!SUPPORTED_ACTIONS.getOrDefault(role, Map.of()).getOrDefault(module, Set.of()).contains(action)) {
             throw new BusinessException("Quyền này không được backend hỗ trợ cho phân hệ đã chọn");
         }
+        OffsetDateTime changedAt = OffsetDateTime.now();
         int changed = jdbc.update("""
-                merge role_permissions as target
-                using (select ? role_code,? module_code,? action_code) source
-                on target.role_code=source.role_code and target.module_code=source.module_code and target.action_code=source.action_code
-                when matched then update set granted=?,changed_by_user_id=?,changed_at=?
-                when not matched then insert(role_code,module_code,action_code,granted,changed_by_user_id,changed_at)
-                    values(source.role_code,source.module_code,source.action_code,?,?,?);
-                """, role.name(), module, action, request.granted(), actorId, OffsetDateTime.now(),
-                request.granted(), actorId, OffsetDateTime.now());
-        if (changed == 0) throw new BusinessException("Không tìm thấy role hoặc quyền cần sửa");
+                update role_permissions
+                set granted=?, changed_by_user_id=?, changed_at=?
+                where role_code=? and module_code=? and action_code=?
+                """, request.granted(), actorId, changedAt, role.name(), module, action);
+        if (changed == 0) {
+            jdbc.update("""
+                    insert into role_permissions(role_code,module_code,action_code,granted,changed_by_user_id,changed_at)
+                    values(?,?,?,?,?,?)
+                    """, role.name(), module, action, request.granted(), actorId, changedAt);
+        }
         return new RolePermissionResponse(role.name(), module, action, request.granted());
     }
 }

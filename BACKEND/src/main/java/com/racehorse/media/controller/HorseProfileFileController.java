@@ -2,6 +2,9 @@ package com.racehorse.media.controller;
 
 import com.racehorse.media.dto.HorseProfileFileResponse;
 import com.racehorse.media.service.HorseProfileFileService;
+import com.racehorse.horse.service.HorseService;
+import com.racehorse.auth.entity.Role;
+import org.springframework.security.core.Authentication;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -26,19 +29,23 @@ import java.util.UUID;
 public class HorseProfileFileController {
 
     private final HorseProfileFileService service;
+    private final HorseService horseService;
 
-    public HorseProfileFileController(HorseProfileFileService service) {
+    public HorseProfileFileController(HorseProfileFileService service, HorseService horseService) {
         this.service = service;
+        this.horseService = horseService;
     }
 
     @GetMapping
     @PreAuthorize("hasAuthority('PERM_PROFILE_VIEW')")
-    HorseProfileFileResponse get(@PathVariable UUID horseId) {
+    HorseProfileFileResponse get(@PathVariable UUID horseId, @AuthenticationPrincipal Jwt jwt,
+            Authentication authentication) {
+        horseService.getByIdForUser(horseId, userId(jwt), accessRole(authentication));
         return service.getActive(horseId);
     }
 
     @PutMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
+    @PreAuthorize("(hasAuthority('PERM_PROFILE_EDIT') and hasRole('CLUB_MANAGER')) or (hasAuthority('PERM_PROFILE_VIEW') and hasRole('HORSE_OWNER'))")
     HorseProfileFileResponse replace(
             @PathVariable UUID horseId,
             @AuthenticationPrincipal Jwt jwt,
@@ -47,7 +54,7 @@ public class HorseProfileFileController {
     }
 
     @DeleteMapping
-    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
+    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasRole('CLUB_MANAGER')")
     ResponseEntity<Void> delete(@PathVariable UUID horseId) {
         service.deleteActive(horseId);
         return ResponseEntity.noContent().build();
@@ -65,13 +72,13 @@ public class HorseProfileFileController {
     }
 
     @GetMapping("/proposals")
-    @PreAuthorize("hasAuthority('PERM_PROFILE_APPROVE') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
+    @PreAuthorize("hasAuthority('PERM_PROFILE_APPROVE') and hasRole('CLUB_MANAGER')")
     List<HorseProfileFileResponse> pendingProposals(@PathVariable UUID horseId) {
         return service.pendingProposals(horseId);
     }
 
     @PostMapping("/proposals/{proposalId}/approve")
-    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
+    @PreAuthorize("hasAuthority('PERM_PROFILE_APPROVE') and hasRole('CLUB_MANAGER')")
     HorseProfileFileResponse approve(
             @PathVariable UUID horseId,
             @PathVariable UUID proposalId,
@@ -80,7 +87,7 @@ public class HorseProfileFileController {
     }
 
     @PostMapping("/proposals/{proposalId}/reject")
-    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
+    @PreAuthorize("hasAuthority('PERM_PROFILE_APPROVE') and hasRole('CLUB_MANAGER')")
     ResponseEntity<Void> reject(
             @PathVariable UUID horseId,
             @PathVariable UUID proposalId,
@@ -91,5 +98,16 @@ public class HorseProfileFileController {
 
     private UUID userId(Jwt jwt) {
         return UUID.fromString(jwt.getSubject());
+    }
+
+    private Role accessRole(Authentication authentication) {
+        for (Role role : new Role[] {Role.CLUB_MANAGER, Role.HEAD_TRAINER,
+                Role.VETERINARIAN, Role.STABLE_STAFF, Role.HORSE_OWNER}) {
+            if (authentication.getAuthorities().stream()
+                    .anyMatch(authority -> authority.getAuthority().equals("ROLE_" + role.name()))) {
+                return role;
+            }
+        }
+        throw new org.springframework.security.access.AccessDeniedException("Không có quyền xem ảnh ngựa");
     }
 }

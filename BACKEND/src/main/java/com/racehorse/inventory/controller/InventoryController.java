@@ -2,10 +2,12 @@ package com.racehorse.inventory.controller;
 
 import com.racehorse.inventory.dto.*;
 import com.racehorse.inventory.service.InventoryService;
+import com.racehorse.common.exception.BusinessException;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.core.Authentication;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
 
@@ -25,7 +27,7 @@ public class InventoryController {
     // ==================== ITEMS ====================
 
     @GetMapping("/items")
-    @PreAuthorize("hasAuthority('PERM_STABLE_CARE_VIEW')")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_VIEW') and !hasRole('HORSE_OWNER')")
     public List<InventoryItemResponse> listItems(
             @RequestParam(required = false) String category,
             @RequestParam(required = false) Boolean lowStockOnly,
@@ -34,14 +36,14 @@ public class InventoryController {
     }
 
     @GetMapping("/items/{id}")
-    @PreAuthorize("hasAuthority('PERM_STABLE_CARE_VIEW')")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_VIEW') and !hasRole('HORSE_OWNER')")
     public InventoryItemResponse getItem(@PathVariable UUID id) {
         return service.getItem(id);
     }
 
     @PostMapping("/items")
     @ResponseStatus(HttpStatus.CREATED)
-    @PreAuthorize("hasAnyRole('CLUB_MANAGER','HEAD_TRAINER') and hasAuthority('PERM_STABLE_CARE_EDIT')")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_EDIT') and hasRole('CLUB_MANAGER')")
     public InventoryItemResponse createItem(
             @AuthenticationPrincipal Jwt jwt,
             @Valid @RequestBody CreateInventoryItemRequest request) {
@@ -49,7 +51,7 @@ public class InventoryController {
     }
 
     @PutMapping("/items/{id}")
-    @PreAuthorize("hasAnyRole('CLUB_MANAGER','HEAD_TRAINER') and hasAuthority('PERM_STABLE_CARE_EDIT')")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_EDIT') and hasRole('CLUB_MANAGER')")
     public InventoryItemResponse updateItem(
             @PathVariable UUID id,
             @AuthenticationPrincipal Jwt jwt,
@@ -59,7 +61,7 @@ public class InventoryController {
 
     @DeleteMapping("/items/{id}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
-    @PreAuthorize("hasRole('CLUB_MANAGER') and hasAuthority('PERM_STABLE_CARE_EDIT')")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_EDIT') and hasRole('CLUB_MANAGER')")
     public void deleteItem(
             @PathVariable UUID id,
             @AuthenticationPrincipal Jwt jwt) {
@@ -67,7 +69,7 @@ public class InventoryController {
     }
 
     @PutMapping("/items/{id}/stock")
-    @PreAuthorize("hasAuthority('PERM_STABLE_CARE_EDIT')")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_EDIT') and hasRole('CLUB_MANAGER')")
     public InventoryItemResponse updateStock(
             @PathVariable UUID id,
             @AuthenticationPrincipal Jwt jwt,
@@ -77,14 +79,22 @@ public class InventoryController {
 
     @PostMapping("/items/{id}/usage")
     @ResponseStatus(HttpStatus.CREATED)
-    @PreAuthorize("hasRole('CLUB_MANAGER') and hasAuthority('PERM_STABLE_CARE_EDIT')")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_EDIT') and hasAnyRole('CLUB_MANAGER','STABLE_STAFF')")
     public InventoryUsageResponse recordUsage(@PathVariable UUID id, @AuthenticationPrincipal Jwt jwt,
+                                              Authentication authentication,
                                               @Valid @RequestBody RecordInventoryUsageRequest request) {
+        boolean stableStaff = authentication.getAuthorities().stream()
+                .anyMatch(authority -> "ROLE_STABLE_STAFF".equals(authority.getAuthority()));
+        if (stableStaff && (request.horseId() == null || request.stableId() != null
+                || request.requestedByRole() == null || request.requestedByRole().isBlank()
+                || request.notes() == null || request.notes().isBlank())) {
+            throw new BusinessException("Nhân viên chuồng phải chọn bộ phận cần vật tư, ngựa sử dụng và lý do xuất dùng");
+        }
         return service.recordUsage(id, UUID.fromString(jwt.getSubject()), request);
     }
 
     @GetMapping("/usage")
-    @PreAuthorize("hasRole('CLUB_MANAGER') and hasAuthority('PERM_STABLE_CARE_VIEW')")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_VIEW') and !hasRole('HORSE_OWNER')")
     public List<InventoryUsageResponse> listUsage(@RequestParam(defaultValue = "20") int limit) {
         return service.listUsage(limit);
     }
@@ -92,21 +102,21 @@ public class InventoryController {
     // ==================== REPLENISHMENTS ====================
 
     @GetMapping("/replenishments")
-    @PreAuthorize("hasAuthority('PERM_STABLE_CARE_VIEW')")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_VIEW') and !hasRole('HORSE_OWNER')")
     public List<ReplenishmentResponse> listReplenishments(
             @RequestParam(required = false) String status) {
         return service.listReplenishments(status);
     }
 
     @GetMapping("/replenishments/{id}")
-    @PreAuthorize("hasAuthority('PERM_STABLE_CARE_VIEW')")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_VIEW') and !hasRole('HORSE_OWNER')")
     public ReplenishmentResponse getReplenishment(@PathVariable UUID id) {
         return service.getReplenishment(id);
     }
 
     @PostMapping("/replenishments")
     @ResponseStatus(HttpStatus.CREATED)
-    @PreAuthorize("hasAuthority('PERM_STABLE_CARE_EDIT')")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_EDIT') and hasAnyRole('CLUB_MANAGER','STABLE_STAFF')")
     public ReplenishmentResponse createReplenishment(
             @AuthenticationPrincipal Jwt jwt,
             @Valid @RequestBody CreateReplenishmentRequest request) {
@@ -114,7 +124,7 @@ public class InventoryController {
     }
 
     @PostMapping("/replenishments/{id}/review")
-    @PreAuthorize("hasRole('CLUB_MANAGER') and (hasAuthority('PERM_STABLE_CARE_EDIT') or hasAuthority('PERM_STABLE_CARE_APPROVE'))")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_APPROVE') and hasRole('CLUB_MANAGER')")
     public ReplenishmentResponse reviewReplenishment(
             @PathVariable UUID id,
             @AuthenticationPrincipal Jwt jwt,
@@ -123,7 +133,7 @@ public class InventoryController {
     }
 
     @PostMapping("/replenishments/{id}/receive")
-    @PreAuthorize("hasRole('CLUB_MANAGER') and hasAuthority('PERM_STABLE_CARE_EDIT')")
+    @PreAuthorize("hasAuthority('PERM_INVENTORY_CLAIM') and hasAnyRole('CLUB_MANAGER','STABLE_STAFF')")
     public ReplenishmentResponse receiveReplenishment(
             @PathVariable UUID id, @AuthenticationPrincipal Jwt jwt,
             @Valid @RequestBody ReceiveReplenishmentRequest request) {

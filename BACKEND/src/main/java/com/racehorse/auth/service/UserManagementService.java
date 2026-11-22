@@ -28,19 +28,25 @@ public class UserManagementService {
     private final PasswordEncoder passwordEncoder;
     private final LoginSessionRepository loginSessionRepository;
     private final Clock clock;
+    private final AccountActivityGuard activityGuard;
     public UserManagementService(
             UserAccountRepository userRepository,
             PasswordEncoder passwordEncoder,
             LoginSessionRepository loginSessionRepository,
-            Clock clock) {
+            Clock clock,
+            AccountActivityGuard activityGuard) {
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
         this.loginSessionRepository = loginSessionRepository;
         this.clock = clock;
+        this.activityGuard = activityGuard;
     }
 
     @Transactional
     public UserResponse create(CreateUserRequest request) {
+        if (request.roles() == null || request.roles().size() != 1) {
+            throw new BusinessException("Mỗi tài khoản chỉ được có đúng một vai trò");
+        }
         return createAccount(
                 request.username(),
                 request.email(),
@@ -62,18 +68,25 @@ public class UserManagementService {
 
     @Transactional
     public UserResponse updateRoles(UUID actorId, UUID targetUserId, UpdateUserRolesRequest request) {
+        if (request.roles() == null || request.roles().size() != 1) {
+            throw new BusinessException("Mỗi tài khoản chỉ được có đúng một vai trò");
+        }
         if (actorId.equals(targetUserId)) {
             throw new BusinessException("CLUB_MANAGER không thể tự thay đổi role của chính mình");
         }
         UserAccount target = userRepository.findById(targetUserId)
                 .orElseThrow(() -> new ResourceNotFoundException(
                         "Không tìm thấy tài khoản: " + targetUserId));
+        if (target.getRoles().equals(request.roles())) {
+            return toResponse(target);
+        }
         boolean removesManager = target.isEnabled()
                 && target.getRoles().contains(Role.CLUB_MANAGER)
                 && !request.roles().contains(Role.CLUB_MANAGER);
         if (removesManager && userRepository.findActiveClubManagersForUpdate().size() <= 1) {
             throw new BusinessException("Phải giữ ít nhất một Club Manager hoạt động");
         }
+        activityGuard.requireEligibleForRoleChange(targetUserId);
         target.replaceRoles(request.roles());
         loginSessionRepository.revokeAllActiveByUserId(targetUserId, clock.instant());
         return toResponse(target);
@@ -89,8 +102,9 @@ public class UserManagementService {
 
     @Transactional(readOnly = true)
     public Page<UserResponse> search(String query, Pageable pageable) {
-        String normalized = query == null || query.isBlank() ? null : query.trim();
-        return userRepository.search(normalized, pageable).map(this::toResponse);
+        boolean matchAll = query == null || query.isBlank();
+        String pattern = matchAll ? "%" : "%" + query.trim().toLowerCase(Locale.ROOT) + "%";
+        return userRepository.search(matchAll, pattern, pageable).map(this::toResponse);
     }
 
     private UserResponse createAccount(

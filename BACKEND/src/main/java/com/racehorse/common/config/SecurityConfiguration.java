@@ -1,7 +1,10 @@
 package com.racehorse.common.config;
 
 import com.racehorse.auth.repository.UserAccountRepository;
+import com.racehorse.auth.service.RolePermissionService;
 import com.racehorse.audit.security.AuditMutationFilter;
+import com.racehorse.wallet.OwnerOverdueFilter;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -28,16 +31,26 @@ import java.util.UUID;
 public class SecurityConfiguration {
 
     @Bean
+    FilterRegistrationBean<OwnerOverdueFilter> ownerOverdueFilterRegistration(OwnerOverdueFilter filter) {
+        FilterRegistrationBean<OwnerOverdueFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false);
+        return registration;
+    }
+
+    @Bean
     SecurityFilterChain securityFilterChain(
             HttpSecurity http,
             JwtAuthenticationConverter jwtAuthenticationConverter,
-            AuditMutationFilter auditMutationFilter) throws Exception {
+            AuditMutationFilter auditMutationFilter,
+            OwnerOverdueFilter ownerOverdueFilter) throws Exception {
         return http
                 .csrf(csrf -> csrf.disable())
                 .cors(Customizer.withDefaults())
                 .headers(headers -> headers.cacheControl(Customizer.withDefaults()))
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
+                        .requestMatchers("/api/races", "/api/races/**", "/api/horses/*/race-results", "/api/horses/*/race-results/**")
+                        .denyAll()
                         .requestMatchers(
                                 "/actuator/health",
                                 "/api/auth/register-roles",
@@ -45,7 +58,9 @@ public class SecurityConfiguration {
                                 "/api/auth/login",
                                 "/api/auth/refresh",
                                 "/api/auth/logout",
-                                "/api/care-tasks/*/photo")
+                                "/api/wallet/payos/webhook",
+                                "/api/wallet/vnpay/ipn",
+                                "/api/wallet/vnpay/return")
                         .permitAll()
                         .anyRequest().authenticated())
                 .oauth2ResourceServer(oauth2 -> oauth2
@@ -57,10 +72,11 @@ public class SecurityConfiguration {
     @Bean
     CorsConfigurationSource corsConfigurationSource(CorsProperties properties) {
         CorsConfiguration configuration = new CorsConfiguration();
-        configuration.setAllowedOrigins(properties.allowedOrigins());
+        configuration.setAllowedOriginPatterns(properties.allowedOrigins());
         configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
-        configuration.setAllowedHeaders(List.of("Authorization", "Content-Type"));
+        configuration.setAllowedHeaders(List.of("*"));
         configuration.setAllowCredentials(true);
+        configuration.setAllowPrivateNetwork(true);
 
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/**", configuration);
@@ -78,12 +94,17 @@ public class SecurityConfiguration {
                             List<GrantedAuthority> authorities = new ArrayList<>();
                             user.getRoles().forEach(role -> authorities.add(
                                     new SimpleGrantedAuthority("ROLE_" + role.name())));
-                            userRepository.findGrantedPermissionCodes(user.getId()).forEach(permission ->
-                                    authorities.add(new SimpleGrantedAuthority(permission)));
+                            List<String> permissions = user.getRoles().contains(com.racehorse.auth.entity.Role.CLUB_MANAGER)
+                                    ? RolePermissionService.managerPermissions()
+                                    : userRepository.findGrantedPermissionCodes(user.getId());
+                            permissions.stream()
+                                    .filter(permission -> user.getRoles().stream()
+                                            .anyMatch(role -> RolePermissionService.supports(role, permission)))
+                                    .forEach(permission -> authorities.add(new SimpleGrantedAuthority(permission)));
                             return authorities;
                         })
                         .orElse(List.of());
-            } catch (IllegalArgumentException exception) {
+            } catch (Exception exception) {
                 return List.of();
             }
         });

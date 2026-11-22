@@ -8,8 +8,12 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.util.LinkedHashMap;
@@ -17,12 +21,20 @@ import java.util.Map;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
     @ExceptionHandler({UnauthorizedException.class, AuthenticationException.class})
     ResponseEntity<ApiErrorResponse> handleUnauthorized(
             RuntimeException exception,
             HttpServletRequest request) {
         return build(HttpStatus.UNAUTHORIZED, "Thông tin đăng nhập không hợp lệ", request, Map.of());
+    }
+
+    @ExceptionHandler({ForbiddenException.class, org.springframework.security.access.AccessDeniedException.class})
+    ResponseEntity<ApiErrorResponse> handleForbidden(
+            Exception exception,
+            HttpServletRequest request) {
+        return build(HttpStatus.FORBIDDEN, exception.getMessage() != null && !exception.getMessage().isBlank() ? exception.getMessage() : "Không có quyền truy cập", request, Map.of());
     }
 
     @ExceptionHandler(ResourceNotFoundException.class)
@@ -37,6 +49,13 @@ public class GlobalExceptionHandler {
             BusinessException exception,
             HttpServletRequest request) {
         return build(HttpStatus.CONFLICT, exception.getMessage(), request, Map.of());
+    }
+
+    @ExceptionHandler(InvalidInputException.class)
+    ResponseEntity<ApiErrorResponse> handleInvalidInput(
+            InvalidInputException exception,
+            HttpServletRequest request) {
+        return build(HttpStatus.BAD_REQUEST, exception.getMessage(), request, Map.of());
     }
 
     @ExceptionHandler(DataIntegrityViolationException.class)
@@ -71,7 +90,24 @@ public class GlobalExceptionHandler {
     ResponseEntity<ApiErrorResponse> handleUnreadableBody(
             HttpMessageNotReadableException exception,
             HttpServletRequest request) {
-        return build(HttpStatus.BAD_REQUEST, "JSON hoặc giá trị enum không hợp lệ", request, Map.of());
+        exception.printStackTrace();
+        return build(HttpStatus.BAD_REQUEST, "JSON hoặc giá trị enum không hợp lệ: " + exception.getMessage(), request, Map.of());
+    }
+
+    @ExceptionHandler(MissingServletRequestParameterException.class)
+    ResponseEntity<ApiErrorResponse> handleMissingParameter(
+            MissingServletRequestParameterException exception,
+            HttpServletRequest request) {
+        return build(HttpStatus.BAD_REQUEST,
+                "Thiếu tham số: " + exception.getParameterName(), request, Map.of());
+    }
+
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    ResponseEntity<ApiErrorResponse> handleInvalidParameter(
+            MethodArgumentTypeMismatchException exception,
+            HttpServletRequest request) {
+        return build(HttpStatus.BAD_REQUEST,
+                "Giá trị tham số không hợp lệ: " + exception.getName(), request, Map.of());
     }
 
     @ExceptionHandler(MaxUploadSizeExceededException.class)
@@ -81,6 +117,18 @@ public class GlobalExceptionHandler {
         return build(
                 HttpStatus.CONTENT_TOO_LARGE,
                 "File tải lên vượt quá dung lượng cho phép",
+                request,
+                Map.of());
+    }
+
+    @ExceptionHandler(Exception.class)
+    ResponseEntity<ApiErrorResponse> handleGeneral(
+            Exception exception,
+            HttpServletRequest request) {
+        log.error("Unhandled request error at {}", request.getRequestURI(), exception);
+        return build(
+                HttpStatus.INTERNAL_SERVER_ERROR,
+                "Hệ thống gặp lỗi khi xử lý yêu cầu. Vui lòng thử lại sau.",
                 request,
                 Map.of());
     }

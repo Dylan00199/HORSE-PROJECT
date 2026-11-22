@@ -6,6 +6,9 @@ import jakarta.validation.Valid;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDate;
@@ -19,36 +22,49 @@ public class RacetrackController {
 
     @PostMapping("/api/racetracks")
     @ResponseStatus(HttpStatus.CREATED)
-    @PreAuthorize("hasAuthority('PERM_TRAINING_EDIT') and hasRole('CLUB_MANAGER')")
+    @PreAuthorize("hasAuthority('PERM_TRAINING_EDIT') or hasRole('CLUB_MANAGER')")
     RacetrackResponse create(@Valid @RequestBody CreateRacetrackRequest request) { return service.create(request); }
 
     @GetMapping("/api/racetracks")
-    @PreAuthorize("hasAuthority('PERM_TRAINING_VIEW') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
+    @PreAuthorize("hasAuthority('PERM_TRAINING_VIEW') or hasRole('CLUB_MANAGER')")
     List<RacetrackResponse> list() { return service.list(); }
 
-    @GetMapping("/api/racetracks/{racetrackId}/slots")
-    @PreAuthorize("hasAuthority('PERM_TRAINING_VIEW') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
-    List<TrackSlotResponse> slots(@PathVariable UUID racetrackId,
+    @GetMapping("/api/racetracks/{racetrackId}/availability")
+    @PreAuthorize("hasAuthority('PERM_TRAINING_VIEW') or hasRole('CLUB_MANAGER')")
+    List<TrackLaneAvailabilityResponse> availability(@PathVariable UUID racetrackId,
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
-        return service.slots(racetrackId, date);
+        return service.availability(racetrackId, date);
     }
 
     @PostMapping("/api/trial-run-bookings")
     @ResponseStatus(HttpStatus.CREATED)
-    @PreAuthorize("hasAuthority('PERM_TRAINING_EDIT') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
-    TrialRunBookingResponse book(@Valid @RequestBody CreateTrialRunBookingRequest request) { return service.book(request); }
+    @PreAuthorize("hasAuthority('PERM_TRAINING_EDIT') or hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
+    TrialRunBookingResponse book(@Valid @RequestBody CreateTrialRunBookingRequest request,
+            @AuthenticationPrincipal Jwt jwt, Authentication auth) {
+        return service.book(request, userId(jwt), hasRole(auth, "CLUB_MANAGER"), hasRole(auth, "HEAD_TRAINER"));
+    }
 
     @GetMapping("/api/trial-run-bookings")
-    @PreAuthorize("hasAuthority('PERM_TRAINING_VIEW') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
+    @PreAuthorize("hasAuthority('PERM_TRAINING_VIEW') or hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
     List<TrialRunBookingResponse> bookings(@RequestParam(required=false) UUID racetrackId,
             @RequestParam(required=false) UUID horseId,
             @RequestParam(required=false) @DateTimeFormat(iso=DateTimeFormat.ISO.DATE) LocalDate from,
             @RequestParam(required=false) @DateTimeFormat(iso=DateTimeFormat.ISO.DATE) LocalDate to,
-            @RequestParam(defaultValue="false") boolean includeCancelled) {
-        return service.bookings(racetrackId,horseId,from,to,includeCancelled);
+            @RequestParam(defaultValue="false") boolean includeCancelled,
+            @AuthenticationPrincipal Jwt jwt, Authentication auth) {
+        return service.bookings(racetrackId, horseId, from, to, includeCancelled, userId(jwt),
+                hasRole(auth, "CLUB_MANAGER"), hasRole(auth, "HEAD_TRAINER"));
     }
 
     @DeleteMapping("/api/trial-run-bookings/{id}") @ResponseStatus(HttpStatus.NO_CONTENT)
-    @PreAuthorize("hasAuthority('PERM_TRAINING_EDIT') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
-    void cancel(@PathVariable UUID id){service.cancelBooking(id);}
+    @PreAuthorize("hasAuthority('PERM_TRAINING_EDIT') or hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
+    void cancel(@PathVariable UUID id, @AuthenticationPrincipal Jwt jwt, Authentication auth) {
+        service.cancelBooking(id, userId(jwt), hasRole(auth, "CLUB_MANAGER"), hasRole(auth, "HEAD_TRAINER"));
+    }
+
+    private UUID userId(Jwt jwt) { return UUID.fromString(jwt.getSubject()); }
+
+    private boolean hasRole(Authentication auth, String role) {
+        return auth.getAuthorities().stream().anyMatch(authority -> authority.getAuthority().equals("ROLE_" + role));
+    }
 }

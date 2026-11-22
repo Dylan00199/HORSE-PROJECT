@@ -1,5 +1,6 @@
 package com.racehorse.health.dto;
 
+import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -20,8 +21,97 @@ public record MedicalExaminationDetailResponse(
         LocalDate followUpDate,
         String healthStatusAfter,
         OffsetDateTime createdAt,
-        List<AddendumView> addenda
+        List<AddendumView> addenda,
+        List<UUID> preventiveScheduleIds,
+        Integer heartRateBpm,
+        Integer bodyLengthCm,
+        BigDecimal temperatureCelsius,
+        Integer heightCm,
+        BigDecimal weightKg,
+        List<MedicalAttachmentResponse> attachments
 ) {
+    public MedicalExaminationDetailResponse {
+        if (attachments == null) {
+            attachments = List.of();
+        }
+    }
+
+    public MedicalExaminationDetailResponse(
+            UUID id,
+            UUID horseId,
+            String horseCode,
+            String horseName,
+            UUID veterinarianId,
+            String veterinarianName,
+            LocalDate examinationDate,
+            String symptoms,
+            String diagnosis,
+            String treatmentProtocol,
+            String medicationNotes,
+            LocalDate followUpDate,
+            String healthStatusAfter,
+            OffsetDateTime createdAt,
+            List<AddendumView> addenda,
+            List<UUID> preventiveScheduleIds,
+            Integer heartRateBpm,
+            Integer bodyLengthCm,
+            BigDecimal temperatureCelsius,
+            Integer heightCm,
+            BigDecimal weightKg
+    ) {
+        this(id, horseId, horseCode, horseName, veterinarianId, veterinarianName,
+                examinationDate, symptoms, diagnosis, treatmentProtocol, medicationNotes,
+                followUpDate, healthStatusAfter, createdAt, addenda, preventiveScheduleIds,
+                heartRateBpm, bodyLengthCm, temperatureCelsius, heightCm, weightKg, List.of());
+    }
+
+    public MedicalExaminationDetailResponse(
+            UUID id,
+            UUID horseId,
+            String horseCode,
+            String horseName,
+            UUID veterinarianId,
+            String veterinarianName,
+            LocalDate examinationDate,
+            String symptoms,
+            String diagnosis,
+            String treatmentProtocol,
+            String medicationNotes,
+            LocalDate followUpDate,
+            String healthStatusAfter,
+            OffsetDateTime createdAt,
+            List<AddendumView> addenda,
+            List<UUID> preventiveScheduleIds
+    ) {
+        this(id, horseId, horseCode, horseName, veterinarianId, veterinarianName,
+                examinationDate, symptoms, diagnosis, treatmentProtocol, medicationNotes,
+                followUpDate, healthStatusAfter, createdAt, addenda, preventiveScheduleIds,
+                null, null, null, null, null, List.of());
+    }
+
+    public MedicalExaminationDetailResponse(
+            UUID id,
+            UUID horseId,
+            String horseCode,
+            String horseName,
+            UUID veterinarianId,
+            String veterinarianName,
+            LocalDate examinationDate,
+            String symptoms,
+            String diagnosis,
+            String treatmentProtocol,
+            String medicationNotes,
+            LocalDate followUpDate,
+            String healthStatusAfter,
+            OffsetDateTime createdAt,
+            List<AddendumView> addenda
+    ) {
+        this(id, horseId, horseCode, horseName, veterinarianId, veterinarianName,
+                examinationDate, symptoms, diagnosis, treatmentProtocol, medicationNotes,
+                followUpDate, healthStatusAfter, createdAt, addenda, List.of(),
+                null, null, null, null, null, List.of());
+    }
+
     public record AddendumView(
             UUID id,
             UUID authoredByUserId,
@@ -30,4 +120,4 @@ public record MedicalExaminationDetailResponse(
             String healthStatusAfter,
             OffsetDateTime createdAt
     ) {}
-}
+}

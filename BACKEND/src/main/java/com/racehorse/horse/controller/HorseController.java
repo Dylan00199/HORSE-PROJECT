@@ -4,7 +4,9 @@ import com.racehorse.horse.dto.CreateHorseRequest;
 import com.racehorse.horse.dto.HorseResponse;
 import com.racehorse.horse.dto.ReplaceOwnershipRequest;
 import com.racehorse.horse.dto.UpdateHorseRequest;
+import com.racehorse.horse.dto.UpdateOwnedHorseRequest;
 import com.racehorse.horse.entity.HorseStatus;
+import com.racehorse.auth.entity.Role;
 import com.racehorse.horse.service.HorseService;
 import jakarta.validation.Valid;
 import org.springframework.data.domain.Page;
@@ -19,6 +21,7 @@ import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -40,7 +43,7 @@ public class HorseController {
     }
 
     @PostMapping
-    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
+    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasRole('CLUB_MANAGER')")
     ResponseEntity<HorseResponse> create(@Valid @RequestBody CreateHorseRequest request) {
         HorseResponse response = horseService.create(request);
         return ResponseEntity
@@ -48,60 +51,104 @@ public class HorseController {
                 .body(response);
     }
 
-    @GetMapping("/{id}")
-    @PreAuthorize("hasAuthority('PERM_PROFILE_VIEW') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER','VETERINARIAN','STABLE_STAFF','HORSE_OWNER')")
-    HorseResponse getById(@PathVariable UUID id, @AuthenticationPrincipal Jwt jwt, Authentication authentication) {
-        return horseService.getByIdForUser(id, userId(jwt), isPrivileged(authentication));
+    @PostMapping("/mine")
+    @PreAuthorize("hasAuthority('PERM_PROFILE_VIEW') and hasRole('HORSE_OWNER')")
+    ResponseEntity<HorseResponse> createForOwner(@Valid @RequestBody CreateHorseRequest request,
+            @AuthenticationPrincipal Jwt jwt) {
+        HorseResponse response = horseService.createForOwner(request, userId(jwt));
+        return ResponseEntity.created(URI.create("/api/horses/" + response.id())).body(response);
     }
 
     @GetMapping
     @PreAuthorize("hasAuthority('PERM_PROFILE_VIEW') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER','VETERINARIAN','STABLE_STAFF')")
     Page<HorseResponse> search(
-            @RequestParam(required = false) String query,
-            @RequestParam(required = false) HorseStatus status,
-            @PageableDefault(size = 20, sort = "name") Pageable pageable) {
-        return horseService.search(query, status, pageable);
+            @RequestParam(name = "query", required = false) String query,
+            @RequestParam(name = "status", required = false) HorseStatus status,
+            @RequestParam(name = "paidOnly", defaultValue = "false") boolean paidOnly,
+            @PageableDefault(size = 20, sort = "name") Pageable pageable,
+            @AuthenticationPrincipal Jwt jwt, Authentication authentication) {
+        boolean trainer = authentication.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("ROLE_HEAD_TRAINER"));
+        boolean manager = authentication.getAuthorities().stream()
+                .anyMatch(a -> a.getAuthority().equals("ROLE_CLUB_MANAGER"));
+        if (manager) return horseService.search(query, status, paidOnly, pageable);
+        if (trainer) return horseService.searchForTrainer(query, status, userId(jwt), pageable);
+        if (authentication.getAuthorities().stream().anyMatch(a -> a.getAuthority().equals("ROLE_VETERINARIAN")))
+            return horseService.searchForVeterinarian(query, status, pageable);
+        return horseService.search(query, status, true, pageable);
+    }
+
+    @GetMapping("/eligible-for-medical")
+    @PreAuthorize("hasAuthority('PERM_PROFILE_VIEW') and hasAnyRole('CLUB_MANAGER','VETERINARIAN')")
+    java.util.List<HorseResponse> getEligibleForMedical() {
+        return horseService.getEligibleForMedical();
     }
 
     @GetMapping("/mine")
     @PreAuthorize("hasAuthority('PERM_PROFILE_VIEW') and hasRole('HORSE_OWNER')")
     Page<HorseResponse> mine(
             @AuthenticationPrincipal Jwt jwt,
+            @RequestParam(name = "query", required = false) String query,
+            @RequestParam(name = "status", required = false) HorseStatus status,
             @PageableDefault(size = 20, sort = "name") Pageable pageable) {
-        return horseService.findOwnedBy(userId(jwt), pageable);
+        return horseService.findOwnedBy(userId(jwt), query, status, pageable);
+    }
+
+    @GetMapping("/{id:[0-9a-fA-F\\-]{36}}")
+    @PreAuthorize("hasAuthority('PERM_PROFILE_VIEW') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER','VETERINARIAN','STABLE_STAFF','HORSE_OWNER')")
+    HorseResponse getById(@PathVariable("id") UUID id, @AuthenticationPrincipal Jwt jwt, Authentication authentication) {
+        return horseService.getByIdForUser(id, userId(jwt), accessRole(authentication));
     }
 
     @PutMapping("/{id}")
-    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
+    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasRole('CLUB_MANAGER')")
     HorseResponse update(
-            @PathVariable UUID id,
+            @PathVariable("id") UUID id,
             @Valid @RequestBody UpdateHorseRequest request) {
         return horseService.update(id, request);
     }
 
+    @PutMapping("/{id}/mine")
+    @PreAuthorize("hasAuthority('PERM_PROFILE_VIEW') and hasRole('HORSE_OWNER')")
+    HorseResponse updateForOwner(@PathVariable("id") UUID id, @AuthenticationPrincipal Jwt jwt,
+            @Valid @RequestBody UpdateOwnedHorseRequest request) {
+        return horseService.updateForOwner(id, userId(jwt), request);
+    }
+
     @PutMapping("/{id}/ownership")
-    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
+    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasRole('CLUB_MANAGER')")
     HorseResponse replaceOwnership(
-            @PathVariable UUID id,
+            @PathVariable("id") UUID id,
             @Valid @RequestBody ReplaceOwnershipRequest request) {
         return horseService.replaceOwnership(id, request);
     }
 
     @PatchMapping("/{id}/archive")
-    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasAnyRole('CLUB_MANAGER','HEAD_TRAINER')")
-    HorseResponse archive(@PathVariable UUID id) {
+    @PreAuthorize("hasAuthority('PERM_PROFILE_EDIT') and hasRole('CLUB_MANAGER')")
+    HorseResponse archive(@PathVariable("id") UUID id) {
         return horseService.archive(id);
+    }
+
+    @DeleteMapping("/{id}/mine")
+    @PreAuthorize("hasAuthority('PERM_PROFILE_VIEW') and hasRole('HORSE_OWNER')")
+    ResponseEntity<Void> removeForOwner(@PathVariable("id") UUID id, @AuthenticationPrincipal Jwt jwt,
+            @RequestParam(name = "confirmBenefitLoss", defaultValue = "false") boolean confirmBenefitLoss) {
+        horseService.removeForOwner(id, userId(jwt), confirmBenefitLoss);
+        return ResponseEntity.noContent().build();
     }
 
     private UUID userId(Jwt jwt) {
         return UUID.fromString(jwt.getSubject());
     }
 
-    private boolean isPrivileged(Authentication authentication) {
-        return authentication.getAuthorities().stream().anyMatch(authority ->
-                authority.getAuthority().equals("ROLE_CLUB_MANAGER")
-                || authority.getAuthority().equals("ROLE_HEAD_TRAINER")
-                || authority.getAuthority().equals("ROLE_VETERINARIAN")
-                || authority.getAuthority().equals("ROLE_STABLE_STAFF"));
+    private Role accessRole(Authentication authentication) {
+        for (Role role : new Role[] {Role.CLUB_MANAGER, Role.HEAD_TRAINER,
+                Role.VETERINARIAN, Role.STABLE_STAFF, Role.HORSE_OWNER}) {
+            if (authentication.getAuthorities().stream()
+                    .anyMatch(authority -> authority.getAuthority().equals("ROLE_" + role.name()))) {
+                return role;
+            }
+        }
+        throw new org.springframework.security.access.AccessDeniedException("Không có quyền xem hồ sơ ngựa");
     }
 }

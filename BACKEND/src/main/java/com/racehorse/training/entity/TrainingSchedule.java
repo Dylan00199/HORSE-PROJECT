@@ -13,6 +13,7 @@ import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
 
 import java.time.Instant;
+import java.util.UUID;
 
 @Entity
 @Table(name = "training_schedules")
@@ -27,11 +28,14 @@ public class TrainingSchedule extends BaseEntity {
     private Horse horse;
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "assigned_staff_id", nullable = false)
-    private UserAccount assignedStaff;
+    @JoinColumn(name = "racetrack_id", nullable = false)
+    private Racetrack racetrack;
 
     @Column(name = "task_name", nullable = false, length = 300)
     private String taskName;
+
+    @Column(name = "notes", length = 2000)
+    private String notes;
 
     @Enumerated(EnumType.STRING)
     @Column(name = "workload_intensity", nullable = false, length = 10)
@@ -56,13 +60,25 @@ public class TrainingSchedule extends BaseEntity {
     @Column(name = "completed_at")
     private Instant completedAt;
 
+    @Column(name = "session_status", length = 20)
+    private String sessionStatus = "PREPARING";
+
+    @Column(name = "ready_at")
+    private Instant readyAt;
+
+    @Column(name = "ready_by_user_id")
+    private UUID readyByUserId;
+
+    @Column(name = "started_at")
+    private Instant startedAt;
+
     protected TrainingSchedule() {
     }
 
     public TrainingSchedule(
             TrainingPlanPhase phase,
             Horse horse,
-            UserAccount assignedStaff,
+            Racetrack racetrack,
             String taskName,
             WorkloadIntensity workloadIntensity,
             Instant scheduledStart,
@@ -70,7 +86,7 @@ public class TrainingSchedule extends BaseEntity {
             UserAccount createdBy) {
         this.phase = phase;
         this.horse = horse;
-        this.assignedStaff = assignedStaff;
+        this.racetrack = racetrack;
         this.taskName = taskName;
         this.workloadIntensity = workloadIntensity;
         this.scheduledStart = scheduledStart;
@@ -86,14 +102,47 @@ public class TrainingSchedule extends BaseEntity {
         if (completedAt == null) completedAt = time;
     }
 
+    public void markReady(UUID userId, Instant time) {
+        sessionStatus = "READY";
+        readyByUserId = userId;
+        readyAt = time;
+    }
+
+    public void startTraining(Instant time) {
+        sessionStatus = "IN_PROGRESS";
+        startedAt = time;
+    }
+
+    public void finishTraining(Instant time) {
+        sessionStatus = "COMPLETED";
+        completedAt = time;
+    }
+    public void updateDetails(Racetrack track, String name, Instant start, Instant end) {
+        racetrack = track;
+        taskName = name;
+        scheduledStart = start;
+        scheduledEnd = end;
+    }
+
+    public void updateEditableFields(Racetrack track, String name, String sessionNotes,
+            WorkloadIntensity intensity, Instant start, Instant end) {
+        racetrack = track;
+        taskName = name;
+        notes = sessionNotes;
+        if (intensity != null) workloadIntensity = intensity;
+        scheduledStart = start;
+        scheduledEnd = end;
+    }
+
     public void cancel(Instant time) {
         if (cancelledAt == null) cancelledAt = time;
     }
 
     public TrainingPlanPhase getPhase() { return phase; }
     public Horse getHorse() { return horse; }
-    public UserAccount getAssignedStaff() { return assignedStaff; }
+    public Racetrack getRacetrack() { return racetrack; }
     public String getTaskName() { return taskName; }
+    public String getNotes() { return notes; }
     public WorkloadIntensity getWorkloadIntensity() { return workloadIntensity; }
     public Instant getScheduledStart() { return scheduledStart; }
     public Instant getScheduledEnd() { return scheduledEnd; }
@@ -101,4 +150,8 @@ public class TrainingSchedule extends BaseEntity {
     public Instant getPublishedAt() { return publishedAt; }
     public Instant getCancelledAt() { return cancelledAt; }
     public Instant getCompletedAt() { return completedAt; }
+    public String getSessionStatus() { return sessionStatus; }
+    public Instant getReadyAt() { return readyAt; }
+    public UUID getReadyByUserId() { return readyByUserId; }
+    public Instant getStartedAt() { return startedAt; }
 }

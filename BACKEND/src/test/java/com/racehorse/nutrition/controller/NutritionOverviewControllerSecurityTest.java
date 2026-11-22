@@ -1,0 +1,484 @@
+package com.racehorse.nutrition.controller;
+
+import com.racehorse.nutrition.service.NutritionPlanService;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.test.context.support.WithMockUser;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.test.context.ContextConfiguration;
+import org.springframework.test.context.junit.jupiter.SpringExtension;
+import org.springframework.test.context.web.WebAppConfiguration;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.web.context.WebApplicationContext;
+import org.springframework.web.servlet.config.annotation.EnableWebMvc;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+import static org.mockito.Mockito.*;
+import static org.springframework.security.test.web.servlet.setup.SecurityMockMvcConfigurers.springSecurity;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+@ExtendWith(SpringExtension.class)
+@ContextConfiguration(classes = NutritionOverviewControllerSecurityTest.TestConfig.class)
+@WebAppConfiguration
+class NutritionOverviewControllerSecurityTest {
+
+    @Configuration
+    @EnableWebMvc
+    @EnableWebSecurity
+    @EnableMethodSecurity
+    static class TestConfig {
+        @Bean
+        public NutritionPlanService nutritionPlanService() {
+            return mock(NutritionPlanService.class);
+        }
+
+        @Bean
+        public NutritionOverviewController nutritionOverviewController(NutritionPlanService service) {
+            return new NutritionOverviewController(service);
+        }
+
+        @Bean
+        public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+            return http
+                    .csrf(csrf -> csrf.disable())
+                    .authorizeHttpRequests(auth -> auth.anyRequest().authenticated())
+                    .build();
+        }
+    }
+
+    @Autowired
+    private WebApplicationContext context;
+
+    @Autowired
+    private NutritionPlanService service;
+
+    private MockMvc mockMvc;
+
+    @BeforeEach
+    void setUp() {
+        mockMvc = MockMvcBuilders.webAppContextSetup(context)
+                .apply(springSecurity())
+                .build();
+        reset(service);
+    }
+
+    // --- Endpoint 1: /api/nutrition/standard-plans ---
+
+    @Test
+    void standardPlansUnauthenticatedReturnsUnauthorizedOrForbidden() throws Exception {
+        mockMvc.perform(get("/api/nutrition/standard-plans"))
+                .andExpect(status().is4xxClientError());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"PERM_STABLE_CARE_VIEW", "ROLE_HEAD_TRAINER"})
+    void standardPlansAuthorizedUserAllowed() throws Exception {
+        when(service.listStandardPlans()).thenReturn(List.of(Map.of("id", "plan-1")));
+
+        mockMvc.perform(get("/api/nutrition/standard-plans"))
+                .andExpect(status().isOk());
+
+        verify(service).listStandardPlans();
+    }
+
+    @Test
+    @WithMockUser(authorities = {"PERM_STABLE_CARE_VIEW", "ROLE_HORSE_OWNER"})
+    void standardPlansHorseOwnerDeniedEvenWithAuthority() throws Exception {
+        mockMvc.perform(get("/api/nutrition/standard-plans"))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_HEAD_TRAINER"})
+    void standardPlansUserWithoutStableCareViewDenied() throws Exception {
+        mockMvc.perform(get("/api/nutrition/standard-plans"))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(service);
+    }
+
+    // --- Endpoint 2: /api/nutrition/horses-active ---
+
+    @Test
+    void horsesActiveUnauthenticatedReturnsClientError() throws Exception {
+        mockMvc.perform(get("/api/nutrition/horses-active"))
+                .andExpect(status().is4xxClientError());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"PERM_STABLE_CARE_VIEW", "ROLE_STABLE_STAFF"})
+    void horsesActiveAuthorizedUserAllowed() throws Exception {
+        when(service.listHorsesActivePlans(any())).thenReturn(List.of());
+
+        mockMvc.perform(get("/api/nutrition/horses-active?date=2026-10-13"))
+                .andExpect(status().isOk());
+
+        verify(service).listHorsesActivePlans(LocalDate.of(2026, 10, 13));
+    }
+
+    @Test
+    @WithMockUser(authorities = {"PERM_STABLE_CARE_VIEW", "ROLE_HORSE_OWNER"})
+    void horsesActiveHorseOwnerDeniedEvenWithAuthority() throws Exception {
+        mockMvc.perform(get("/api/nutrition/horses-active?date=2026-10-13"))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_STABLE_STAFF"})
+    void horsesActiveUserWithoutStableCareViewDenied() throws Exception {
+        mockMvc.perform(get("/api/nutrition/horses-active"))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(service);
+    }
+
+    // --- Endpoint 3: /api/nutrition/stables-workload ---
+
+    @Test
+    void stablesWorkloadUnauthenticatedReturnsClientError() throws Exception {
+        mockMvc.perform(get("/api/nutrition/stables-workload"))
+                .andExpect(status().is4xxClientError());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"PERM_STABLE_CARE_VIEW", "ROLE_CLUB_MANAGER"})
+    void stablesWorkloadAuthorizedUserAllowed() throws Exception {
+        when(service.getStableWorkload(any())).thenReturn(Map.of("summary", Map.of()));
+
+        mockMvc.perform(get("/api/nutrition/stables-workload?date=2026-10-13"))
+                .andExpect(status().isOk());
+
+        verify(service).getStableWorkload(LocalDate.of(2026, 10, 13));
+    }
+
+    @Test
+    @WithMockUser(authorities = {"PERM_STABLE_CARE_VIEW", "ROLE_HORSE_OWNER"})
+    void stablesWorkloadHorseOwnerDeniedEvenWithAuthority() throws Exception {
+        mockMvc.perform(get("/api/nutrition/stables-workload?date=2026-10-13"))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_CLUB_MANAGER"})
+    void stablesWorkloadUserWithoutStableCareViewDenied() throws Exception {
+        mockMvc.perform(get("/api/nutrition/stables-workload"))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(service);
+    }
+
+    // --- Endpoint 4: POST /api/nutrition/standard-plans ---
+
+    @Test
+    void createStandardPlanUnauthenticatedReturnsClientError() throws Exception {
+        String body = """
+                {
+                    "planCode": "STD_TEST",
+                    "planName": "Khẩu phần thử nghiệm",
+                    "description": "Mô tả",
+                    "targetGroup": "Ngựa mẫu",
+                    "meals": [
+                        {"mealName": "Sáng", "feedingTime": "07:00", "concentrateKg": 1.0, "forageKg": 3.0}
+                    ]
+                }
+                """;
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/api/nutrition/standard-plans")
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().is4xxClientError());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_VETERINARIAN"})
+    void createStandardPlanVeterinarianAllowed() throws Exception {
+        when(service.createStandardPlan(any(), any())).thenReturn(Map.of("planCode", "STD_TEST"));
+
+        String body = """
+                {
+                    "planCode": "STD_TEST",
+                    "planName": "Khẩu phần thử nghiệm",
+                    "description": "Mô tả",
+                    "targetGroup": "Ngựa mẫu",
+                    "meals": [
+                        {"mealName": "Sáng", "feedingTime": "07:00", "concentrateKg": 1.0, "forageKg": 3.0}
+                    ]
+                }
+                """;
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/api/nutrition/standard-plans")
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isCreated());
+
+        verify(service).createStandardPlan(any(), any());
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_STABLE_STAFF", "PERM_STABLE_CARE_EDIT"})
+    void createStandardPlanStableStaffDenied() throws Exception {
+        String body = """
+                {
+                    "planCode": "STD_TEST",
+                    "planName": "Khẩu phần thử nghiệm",
+                    "meals": [{"mealName": "Sáng", "feedingTime": "07:00", "concentrateKg": 1.0, "forageKg": 3.0}]
+                }
+                """;
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/api/nutrition/standard-plans")
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_HEAD_TRAINER", "PERM_STABLE_CARE_EDIT"})
+    void createStandardPlanHeadTrainerDenied() throws Exception {
+        String body = """
+                {
+                    "planCode": "STD_TEST",
+                    "planName": "Khẩu phần thử nghiệm",
+                    "meals": [{"mealName": "Sáng", "feedingTime": "07:00", "concentrateKg": 1.0, "forageKg": 3.0}]
+                }
+                """;
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/api/nutrition/standard-plans")
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_CLUB_MANAGER", "PERM_STABLE_CARE_EDIT"})
+    void createStandardPlanClubManagerDenied() throws Exception {
+        String body = """
+                {
+                    "planCode": "STD_TEST",
+                    "planName": "Khẩu phần thử nghiệm",
+                    "meals": [{"mealName": "Sáng", "feedingTime": "07:00", "concentrateKg": 1.0, "forageKg": 3.0}]
+                }
+                """;
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/api/nutrition/standard-plans")
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_HORSE_OWNER"})
+    void createStandardPlanHorseOwnerDenied() throws Exception {
+        String body = """
+                {
+                    "planCode": "STD_TEST",
+                    "planName": "Khẩu phần thử nghiệm",
+                    "meals": [{"mealName": "Sáng", "feedingTime": "07:00", "concentrateKg": 1.0, "forageKg": 3.0}]
+                }
+                """;
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/api/nutrition/standard-plans")
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    // --- Endpoint 5: PUT /api/nutrition/standard-plans/{planCode} ---
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_VETERINARIAN"})
+    void updateStandardPlanVeterinarianAllowed() throws Exception {
+        when(service.updateStandardPlan(eq("STD_TEST"), any(), any())).thenReturn(Map.of("planCode", "STD_TEST"));
+
+        String body = """
+                {
+                    "planName": "Khẩu phần thử nghiệm đã sửa",
+                    "description": "Mô tả mới",
+                    "targetGroup": "Ngựa mẫu",
+                    "meals": [
+                        {"mealName": "Sáng", "feedingTime": "07:00", "concentrateKg": 1.5, "forageKg": 3.5}
+                    ]
+                }
+                """;
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put("/api/nutrition/standard-plans/STD_TEST")
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk());
+
+        verify(service).updateStandardPlan(eq("STD_TEST"), any(), any());
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_STABLE_STAFF", "PERM_STABLE_CARE_EDIT"})
+    void updateStandardPlanStableStaffDenied() throws Exception {
+        String body = """
+                {
+                    "planName": "Khẩu phần thử nghiệm đã sửa",
+                    "meals": [{"mealName": "Sáng", "feedingTime": "07:00", "concentrateKg": 1.5, "forageKg": 3.5}]
+                }
+                """;
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put("/api/nutrition/standard-plans/STD_TEST")
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_HEAD_TRAINER", "PERM_STABLE_CARE_EDIT"})
+    void updateStandardPlanHeadTrainerDenied() throws Exception {
+        String body = """
+                {
+                    "planName": "Khẩu phần thử nghiệm đã sửa",
+                    "meals": [{"mealName": "Sáng", "feedingTime": "07:00", "concentrateKg": 1.5, "forageKg": 3.5}]
+                }
+                """;
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put("/api/nutrition/standard-plans/STD_TEST")
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_CLUB_MANAGER", "PERM_STABLE_CARE_EDIT"})
+    void updateStandardPlanClubManagerDenied() throws Exception {
+        String body = """
+                {
+                    "planName": "Khẩu phần thử nghiệm đã sửa",
+                    "meals": [{"mealName": "Sáng", "feedingTime": "07:00", "concentrateKg": 1.5, "forageKg": 3.5}]
+                }
+                """;
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put("/api/nutrition/standard-plans/STD_TEST")
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    // --- Endpoint 6: DELETE /api/nutrition/standard-plans/{planCode} ---
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_VETERINARIAN"})
+    void deleteStandardPlanVeterinarianAllowed() throws Exception {
+        doNothing().when(service).deleteStandardPlan(eq("STD_TEST"), any());
+
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete("/api/nutrition/standard-plans/STD_TEST"))
+                .andExpect(status().isNoContent());
+
+        verify(service).deleteStandardPlan(eq("STD_TEST"), any());
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_STABLE_STAFF", "PERM_STABLE_CARE_EDIT"})
+    void deleteStandardPlanStableStaffDenied() throws Exception {
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete("/api/nutrition/standard-plans/STD_TEST"))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_HEAD_TRAINER", "PERM_STABLE_CARE_EDIT"})
+    void deleteStandardPlanHeadTrainerDenied() throws Exception {
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete("/api/nutrition/standard-plans/STD_TEST"))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_CLUB_MANAGER", "PERM_STABLE_CARE_EDIT"})
+    void deleteStandardPlanClubManagerDenied() throws Exception {
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete("/api/nutrition/standard-plans/STD_TEST"))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_HORSE_OWNER"})
+    void deleteStandardPlanHorseOwnerDenied() throws Exception {
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete("/api/nutrition/standard-plans/STD_TEST"))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    // --- Endpoint: /api/nutrition/stables-quick-feed ---
+
+    @Test
+    void stablesQuickFeedUnauthenticatedReturnsClientError() throws Exception {
+        mockMvc.perform(get("/api/nutrition/stables-quick-feed"))
+                .andExpect(status().is4xxClientError());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_STABLE_STAFF", "PERM_STABLE_CARE_VIEW"})
+    void stablesQuickFeedStableStaffAllowed() throws Exception {
+        when(service.getStablesQuickFeed(any(), any(UUID.class))).thenReturn(List.of());
+
+        mockMvc.perform(get("/api/nutrition/stables-quick-feed?date=2026-11-13"))
+                .andExpect(status().isOk());
+
+        verify(service).getStablesQuickFeed(eq(LocalDate.of(2026, 11, 13)), any(UUID.class));
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_VETERINARIAN", "PERM_STABLE_CARE_VIEW"})
+    void stablesQuickFeedVeterinarianDenied() throws Exception {
+        mockMvc.perform(get("/api/nutrition/stables-quick-feed?date=2026-11-13"))
+                .andExpect(status().isForbidden());
+
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_HORSE_OWNER", "PERM_STABLE_CARE_VIEW"})
+    void stablesQuickFeedHorseOwnerDenied() throws Exception {
+        mockMvc.perform(get("/api/nutrition/stables-quick-feed?date=2026-11-13"))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_HEAD_TRAINER", "PERM_STABLE_CARE_VIEW"})
+    void stablesQuickFeedHeadTrainerDenied() throws Exception {
+        mockMvc.perform(get("/api/nutrition/stables-quick-feed?date=2026-11-13"))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_CLUB_MANAGER", "PERM_STABLE_CARE_VIEW"})
+    void stablesQuickFeedClubManagerDenied() throws Exception {
+        mockMvc.perform(get("/api/nutrition/stables-quick-feed?date=2026-11-13"))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    @WithMockUser(authorities = {"ROLE_STABLE_STAFF"})
+    void stablesQuickFeedWithoutPermStableCareViewDenied() throws Exception {
+        mockMvc.perform(get("/api/nutrition/stables-quick-feed?date=2026-11-13"))
+                .andExpect(status().isForbidden());
+        verifyNoInteractions(service);
+    }
+}

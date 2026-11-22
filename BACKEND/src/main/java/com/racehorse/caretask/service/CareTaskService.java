@@ -39,12 +39,12 @@ public class CareTaskService {
                 title, description, task_type, scheduled_date, scheduled_time, status,
                 created_at, updated_at
             )
-            SELECT 
-                NEWID(), d.id, 'ROUTINE', d.scope, NULL,
+            SELECT
+                gen_random_uuid(), d.id, 'ROUTINE', d.scope, NULL,
                 d.title, d.description, d.task_type, ?, d.scheduled_time, 'PENDING',
-                SYSDATETIMEOFFSET(), SYSDATETIMEOFFSET()
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
             FROM dbo.care_routine_definitions d
-            WHERE d.is_active = 1
+            WHERE d.is_active=true
               AND NOT EXISTS (
                   SELECT 1 FROM dbo.care_tasks t
                   WHERE t.routine_definition_id = d.id
@@ -56,6 +56,78 @@ public class CareTaskService {
             jdbc.update(sql, java.sql.Date.valueOf(date), java.sql.Date.valueOf(date));
         } catch (DataIntegrityViolationException ex) {
             // Idempotent catch-up: another concurrent request already inserted the routine instances
+        }
+    }
+
+    @Transactional
+    public void ensureStaffRoutineInstancesForDate(LocalDate date, UUID staffId) {
+        if (date == null || staffId == null) return;
+        try {
+            jdbc.update("""
+                INSERT INTO dbo.care_tasks (
+                    id, routine_definition_id, task_category, scope, horse_id,
+                    title, description, task_type, scheduled_date, scheduled_time,
+                    assigned_staff_id, status, created_at, updated_at
+                )
+                SELECT gen_random_uuid(), d.id, 'ROUTINE', d.scope, NULL,
+                       d.title, d.description, d.task_type, ?, d.scheduled_time,
+                       ?, 'PENDING', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                FROM dbo.care_routine_definitions d
+                WHERE d.is_active=true AND NOT EXISTS (
+                    SELECT 1 FROM dbo.care_tasks t
+                    WHERE t.routine_definition_id=d.id AND t.scheduled_date=?
+                      AND t.horse_id IS NULL AND t.assigned_staff_id=?
+                )
+                """, java.sql.Date.valueOf(date), staffId, java.sql.Date.valueOf(date), staffId);
+        } catch (DataIntegrityViolationException ex) {
+            // A parallel request already created this staff member's copy.
+        }
+    }
+
+    @Transactional
+    public void createRecoveryTask(com.racehorse.training.entity.TrainingSchedule schedule, UUID staffId) {
+        if (schedule == null || staffId == null || schedule.getHorse() == null) return;
+        LocalDate date = schedule.getScheduledStart().atZone(clubZone).toLocalDate();
+        LocalTime time = schedule.getScheduledEnd() != null
+                ? schedule.getScheduledEnd().atZone(clubZone).toLocalTime()
+                : LocalTime.of(11, 0);
+
+        String title = "Hồi phục sau buổi tập - " + schedule.getHorse().getName();
+        String description = "Chăm sóc, làm mát gân chân và kiểm tra thể trạng sau phiên tập: " + schedule.getTaskName();
+
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM dbo.care_tasks WHERE horse_id = ? AND scheduled_date = ? AND title = ?",
+                Integer.class,
+                schedule.getHorse().getId(),
+                java.sql.Date.valueOf(date),
+                title
+        );
+        if (count != null && count > 0) return;
+
+        String sql = """
+            INSERT INTO dbo.care_tasks (
+                id, routine_definition_id, task_category, scope, horse_id,
+                title, description, task_type, scheduled_date, scheduled_time,
+                assigned_staff_id, status, created_by_user_id, created_at, updated_at
+            ) VALUES (
+                gen_random_uuid(), NULL, 'SPECIAL', 'HORSE', ?,
+                ?, ?, 'HEALTH_CHECK', ?, ?,
+                ?, 'PENDING', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            """;
+        try {
+            jdbc.update(
+                    sql,
+                    schedule.getHorse().getId(),
+                    title,
+                    description,
+                    java.sql.Date.valueOf(date),
+                    java.sql.Time.valueOf(time),
+                    staffId,
+                    staffId
+            );
+        } catch (Exception ex) {
+            // Idempotent catch
         }
     }
 
@@ -77,7 +149,7 @@ public class CareTaskService {
             ) VALUES (
                 ?, NULL, 'SPECIAL', ?, ?,
                 ?, NULL, ?, ?, ?,
-                ?, 'PENDING', ?, SYSDATETIMEOFFSET(), SYSDATETIMEOFFSET()
+                ?, 'PENDING', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
             )
             """;
 
@@ -96,13 +168,23 @@ public class CareTaskService {
 
     @Transactional
     public CareTaskResponse completeTask(UUID taskId, UUID actor, CompleteCareTaskRequest request) {
+        return completeTask(taskId, actor, request, false);
+    }
+
+    @Transactional
+    public CareTaskResponse completeTask(UUID taskId, UUID actor, CompleteCareTaskRequest request, boolean manager) {
         String notes = request == null || request.notes() == null ? null : request.notes().trim();
         String photoUrl = request == null || request.photoUrl() == null ? null : request.photoUrl().trim();
-        return executeCompleteTask(taskId, actor, notes, photoUrl, null, null);
+        return executeCompleteTask(taskId, actor, notes, photoUrl, null, null, manager);
     }
 
     @Transactional
     public CareTaskResponse completeTask(UUID taskId, UUID actor, String notes, MultipartFile file) {
+        return completeTask(taskId, actor, notes, file, false);
+    }
+
+    @Transactional
+    public CareTaskResponse completeTask(UUID taskId, UUID actor, String notes, MultipartFile file, boolean manager) {
         String cleanNotes = notes == null ? null : notes.trim();
         byte[] photoBytes = null;
         String contentType = null;
@@ -124,11 +206,12 @@ public class CareTaskService {
             photoUrl = "/api/care-tasks/" + taskId + "/photo";
         }
 
-        return executeCompleteTask(taskId, actor, cleanNotes, photoUrl, photoBytes, contentType);
+        return executeCompleteTask(taskId, actor, cleanNotes, photoUrl, photoBytes, contentType, manager);
     }
 
     private CareTaskResponse executeCompleteTask(
-            UUID taskId, UUID actor, String notes, String photoUrl, byte[] photoBytes, String photoContentType) {
+            UUID taskId, UUID actor, String notes, String photoUrl, byte[] photoBytes, String photoContentType,
+            boolean manager) {
         CareTaskResponse existing = getTask(taskId);
         if ("COMPLETED".equals(existing.status())) {
             throw new BusinessException("Nhiệm vụ này đã được hoàn thành trước đó");
@@ -136,28 +219,55 @@ public class CareTaskService {
         if ("CANCELLED".equals(existing.status())) {
             throw new BusinessException("Không thể hoàn thành nhiệm vụ đã bị hủy");
         }
+        if (!manager && !actor.equals(existing.assignedStaffId())) {
+            throw new BusinessException("Bạn không được phân công nhiệm vụ chăm sóc này");
+        }
 
         List<String> names = jdbc.query(
                 "SELECT username FROM dbo.users WHERE id = ?",
                 (rs, rn) -> rs.getString("username"), actor);
         String staffName = names.isEmpty() ? "Nhân viên chuồng" : names.getFirst();
 
-        jdbc.update(
-                """
-                UPDATE dbo.care_tasks
-                SET status = 'COMPLETED',
-                    completed_at = SYSDATETIMEOFFSET(),
-                    completed_by_user_id = ?,
-                    completed_by_name = ?,
-                    completion_notes = ?,
-                    photo_url = ?,
-                    photo_bytes = ?,
-                    photo_content_type = ?,
-                    updated_at = SYSDATETIMEOFFSET()
-                WHERE id = ?
-                """,
-                actor, staffName, notes, photoUrl, photoBytes, photoContentType, taskId
-        );
+        int updated;
+        if (manager) {
+            updated = jdbc.update(
+                    """
+                    UPDATE dbo.care_tasks
+                    SET status = 'COMPLETED',
+                        completed_at = CURRENT_TIMESTAMP,
+                        completed_by_user_id = ?,
+                        completed_by_name = ?,
+                        completion_notes = ?,
+                        photo_url = ?,
+                        photo_bytes = ?,
+                        photo_content_type = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = 'PENDING'
+                    """,
+                    actor, staffName, notes, photoUrl, photoBytes, photoContentType, taskId
+            );
+        } else {
+            updated = jdbc.update(
+                    """
+                    UPDATE dbo.care_tasks
+                    SET status = 'COMPLETED',
+                        completed_at = CURRENT_TIMESTAMP,
+                        completed_by_user_id = ?,
+                        completed_by_name = ?,
+                        completion_notes = ?,
+                        photo_url = ?,
+                        photo_bytes = ?,
+                        photo_content_type = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = 'PENDING'
+                      AND assigned_staff_id = ?
+                    """,
+                    actor, staffName, notes, photoUrl, photoBytes, photoContentType, taskId, actor
+            );
+        }
+        if (updated != 1) {
+            throw new BusinessException("Nhiệm vụ đã thay đổi trạng thái hoặc không còn được phân công cho bạn");
+        }
 
         return getTask(taskId);
     }
@@ -191,9 +301,12 @@ public class CareTaskService {
         if ("COMPLETED".equals(existing.status())) {
             throw new BusinessException("Không thể hủy nhiệm vụ đã hoàn thành");
         }
-        jdbc.update(
-                "UPDATE dbo.care_tasks SET status = 'CANCELLED', updated_at = SYSDATETIMEOFFSET() WHERE id = ?",
+        int updated = jdbc.update(
+                "UPDATE dbo.care_tasks SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'PENDING'",
                 taskId);
+        if (updated != 1) {
+            throw new BusinessException("Nhiệm vụ đã thay đổi trạng thái; không thể hủy");
+        }
         return getTask(taskId);
     }
 
@@ -214,7 +327,7 @@ public class CareTaskService {
             ensureRoutineInstancesForDate(date);
         }
 
-        StringBuilder sql = new StringBuilder(baseSelect()).append(" WHERE 1=1 ");
+        StringBuilder sql = new StringBuilder(baseSelect()).append(" WHERE t.task_category <> 'ARCHIVED_ROUTINE' ");
         List<Object> args = new ArrayList<>();
 
         if (horseId != null) {
@@ -244,9 +357,15 @@ public class CareTaskService {
         return list;
     }
 
+    @Transactional
+    public List<CareTaskResponse> listStaffTasks(UUID staffId, LocalDate date, String status, Boolean overdueOnly) {
+        ensureStaffRoutineInstancesForDate(date, staffId);
+        return listTasks(null, staffId, date, status, overdueOnly);
+    }
+
     private String baseSelect() {
         return """
-            SELECT 
+            SELECT
                 t.id,
                 t.routine_definition_id,
                 t.task_category,

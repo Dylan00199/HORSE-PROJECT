@@ -1,12 +1,15 @@
+import UnitStepNumberInput from './UnitStepNumberInput'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { AlertTriangle, ArchiveRestore, ArrowRight, Boxes, Check, CheckCircle2, ChevronLeft, ChevronRight, ChevronUp, DollarSign, Download, Filter, HeartPulse, KeyRound, Lock, LogOut, Monitor, Package, Pencil, Plus, RotateCcw, Save, ScrollText, Search, ShieldCheck, SlidersHorizontal, Smartphone, Tag, Trash2, Unlock, UserPlus, Utensils, Warehouse, X, XCircle } from 'lucide-react'
-import { api, inventoryApi, stableCareApi } from './api'
+import { api, apiFetch, inventoryApi, stableCareApi } from './api'
+import { horseIcon } from './navIcons'
+import { handleImageFallback } from './imageFallback'
 
 const initials = (name = '') => name.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || 'RC'
 
 const ROLES={CLUB_MANAGER:'Quản lý câu lạc bộ',HEAD_TRAINER:'Huấn luyện viên trưởng',VETERINARIAN:'Bác sĩ thú y',STABLE_STAFF:'Nhân viên chuồng',HORSE_OWNER:'Chủ sở hữu ngựa'}
-const MODULES={PROFILE:'Hồ sơ ngựa',TRAINING:'Huấn luyện',MEDICAL:'Y tế',STABLE_CARE:'Chăm sóc chuồng',RACING:'Giải đua',REPORTING:'Báo cáo'}
+const MODULES={PROFILE:'Hồ sơ ngựa',TRAINING:'Huấn luyện',MEDICAL:'Y tế',STABLE_CARE:'Chăm sóc chuồng',REPORTING:'Báo cáo',INVENTORY:'Kho vật tư',SYSTEM:'Hệ thống'}
 const money=(value)=>new Intl.NumberFormat('vi-VN',{style:'currency',currency:'VND',maximumFractionDigits:0}).format(value||0)
 const monthNow=()=>new Date().toISOString().slice(0,7)
 const priorMonth=(month)=>{
@@ -242,7 +245,7 @@ export function PermissionsPage(){
   useEffect(()=>{void load()},[load])
   const safeItems = Array.isArray(items) ? items : []
   const roles=Object.keys(ROLES).filter(r=>r!=='CLUB_MANAGER');
-  const modules=[...new Set(safeItems.map(x=>x.module))];
+  const modules=[...new Set(safeItems.filter(x=>x.module!=='RACING').map(x=>x.module))];
   const toggle=async item=>{
     const key=`${item.role}-${item.module}-${item.action}`;
     setBusy(key); setError('');
@@ -255,7 +258,7 @@ export function PermissionsPage(){
       setBusy('');
     }
   }
-  return <><Heading eyebrow="PHÂN QUYỀN RBAC" title="Ma trận quyền theo vai trò" text="Bật hoặc tắt các quyền mà từng phân hệ thực sự hỗ trợ."/>{error&&<Notice text={error}/>} {loading?<section className="card simple-empty">Đang tải ma trận quyền…</section>:modules.length?<div className="permission-grid">{roles.map(role=><section className="card permission-card" key={role}><SectionHead icon={SlidersHorizontal} title={ROLES[role]}/><div className="permission-head"><span>Phân hệ</span><span>Xem</span><span>Sửa</span><span>Duyệt</span></div>{modules.map(module=><div className="permission-row" key={module}><b>{MODULES[module]||module}</b>{['VIEW','EDIT','APPROVE'].map(action=>{const item=safeItems.find(x=>x.role===role&&x.module===module&&x.action===action);const key=`${role}-${module}-${action}`;return item?<button aria-label={`${ROLES[role]} ${MODULES[module]||module} ${action}`} disabled={busy===key} className={item.granted?'granted':''} key={action} onClick={()=>toggle(item)}>{item.granted?<Check size={15}/>:<X size={15}/>}</button>:<span className="unsupported-permission" key={action}>—</span>})}</div>)}</section>)}</div>:<section className="card simple-empty">Chưa có dữ liệu phân quyền.</section>}</>
+  return <><Heading eyebrow="PHÂN QUYỀN RBAC" title="Ma trận quyền theo vai trò" text="Bật hoặc tắt các quyền mà từng phân hệ thực sự hỗ trợ."/>{error&&<Notice text={error}/>} {loading?<section className="card simple-empty">Đang tải ma trận quyền…</section>:modules.length?<div className="permission-grid">{roles.map(role=><section className="card permission-card" key={role}><SectionHead icon={SlidersHorizontal} title={ROLES[role]}/><div className="permission-head"><span>Phân hệ</span><span>Xem</span><span>Sửa</span><span>Duyệt</span><span>Tiếp nhận</span></div>{modules.map(module=><div className="permission-row" key={module}><b>{MODULES[module]||module}</b>{['VIEW','EDIT','APPROVE','CLAIM'].map(action=>{const item=safeItems.find(x=>x.role===role&&x.module===module&&x.action===action);const key=`${role}-${module}-${action}`;return item?<button aria-label={`${ROLES[role]} ${MODULES[module]||module} ${action}`} disabled={busy===key} className={item.granted?'granted':''} key={action} onClick={()=>toggle(item)}>{item.granted?<Check size={15}/>:<X size={15}/>}</button>:<span className="unsupported-permission" key={action}>—</span>})}</div>)}</section>)}</div>:<section className="card simple-empty">Chưa có dữ liệu phân quyền.</section>}</>
 }
 function checkPasswordStrength(pw){
   if(!pw)return{score:0,label:'',color:'',width:'0%'};
@@ -371,7 +374,7 @@ function CreateAccount({onClose,onSaved}){
       setError('Mật khẩu cần ít nhất 8 ký tự');
       return;
     }
-    try{
+    if(!form.roles||form.roles.length!==1){setError('Mỗi tài khoản chỉ được có đúng một vai trò');return;} try{
       await api('/api/users',{method:'POST',body:JSON.stringify(form)});
       onSaved();
     }catch(x){
@@ -396,7 +399,7 @@ function CreateAccount({onClose,onSaved}){
 function ManageAccount({user,onClose,onSaved}){
   const [username,setUsername]=useState(user.username);
   const [email,setEmail]=useState(user.email);
-  const [roles,setRoles]=useState(user.roles);
+  const [roles,setRoles]=useState(user.roles&&user.roles.length?[user.roles[0]]:['STABLE_STAFF']);
   const [password,setPassword]=useState('');
   const [error,setError]=useState('');
   const run=async fn=>{setError('');try{await fn();onSaved()}catch(e){setError(e.message)}};
@@ -407,7 +410,8 @@ function ManageAccount({user,onClose,onSaved}){
       <Input label="Email" type="email" value={email} onChange={setEmail}/>
       <button className="button secondary" onClick={()=>run(()=>api(`/api/admin/accounts/${user.id}`,{method:'PUT',body:JSON.stringify({username,email})}))}><Pencil size={16}/>Lưu thông tin</button>
       <RoleChecks chosen={roles} setChosen={setRoles}/>
-      <button className="button secondary" onClick={()=>run(()=>api(`/api/users/${user.id}/roles`,{method:'PUT',body:JSON.stringify({roles})}))}><ShieldCheck size={16}/>Lưu vai trò</button>
+      <small>Chỉ đổi vai trò khi tài khoản chưa tham gia nghiệp vụ; cần bàn giao nhiệm vụ đang mở trước khi khóa.</small>
+      <button className="button secondary" disabled={roles[0]===user.roles?.[0]} onClick={()=>run(()=>api(`/api/users/${user.id}/roles`,{method:'PUT',body:JSON.stringify({roles:roles.slice(0,1)})}))}><ShieldCheck size={16}/>Lưu vai trò</button>
       <div style={{display:'grid',gap:'4px'}}>
         <div className="inline-action">
           <input type="password" minLength="8" value={password} onChange={e=>setPassword(e.target.value)} placeholder="Mật khẩu mới, tối thiểu 8 ký tự"/>
@@ -421,7 +425,7 @@ function ManageAccount({user,onClose,onSaved}){
   </Dialog>;
 }
 
-function RoleChecks({chosen,setChosen}){const toggle=r=>setChosen(chosen.includes(r)?chosen.filter(x=>x!==r):[...chosen,r]);return <div className="compact-roles">{Object.entries(ROLES).map(([r,l])=><label className={chosen.includes(r)?'chosen':''} key={r}><input type="checkbox" checked={chosen.includes(r)} onChange={()=>toggle(r)}/><span>{l}</span>{chosen.includes(r)&&<Check size={15}/>}</label>)}</div>}
+function RoleChecks({chosen,setChosen}){const selectedRole=chosen&&chosen.length?chosen[0]:'';return <div className="compact-roles">{Object.entries(ROLES).map(([r,l])=><label className={selectedRole===r?'chosen':''} key={r}><input type="radio" name="admin-account-role" checked={selectedRole===r} onChange={()=>setChosen([r])}/><span>{l}</span>{selectedRole===r&&<Check size={15}/>}</label>)}</div>}
 
 export function ArchivedHorses(){const [items,setItems]=useState([]);const [query,setQuery]=useState('');const [error,setError]=useState('');const [loading,setLoading]=useState(true);const load=useCallback(()=>{setLoading(true);api(`/api/admin/horses/archived?size=100&query=${encodeURIComponent(query)}`).then(res=>setItems(Array.isArray(res)?res:[])).catch(e=>setError(e.message)).finally(()=>setLoading(false))},[query]);useEffect(()=>{void load()},[load]);const safeItems=Array.isArray(items)?items:[];const restore=async h=>{if(!confirm(`Khôi phục hồ sơ ${h.name}?`))return;try{await api(`/api/admin/horses/${h.id}/restore`,{method:'PATCH'});await load()}catch(e){setError(e.message)}};return <><Heading eyebrow="QUẢN LÝ NGỰA" title="Hồ sơ đã lưu trữ" text="Kiểm tra và khôi phục hồ sơ ngựa khi cần."/><div className="toolbar card"><label className="search-box"><Search size={17}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Tên hoặc mã ngựa…"/></label></div>{error&&<Notice text={error}/>}<section className="card archived-list">{loading ? <div className="simple-empty">Đang tải hồ sơ lưu trữ…</div> : !safeItems.length ? <div className="simple-empty">Không có hồ sơ đã lưu trữ.</div> : safeItems.map(h=><div key={h.id}><div><b>{h.name}</b><small>{h.code} · {h.breed} · Lưu {h.archivedAt ? new Date(h.archivedAt).toLocaleString('vi-VN') : '—'}</small></div><button className="button secondary" onClick={()=>restore(h)}><ArchiveRestore size={16}/>Khôi phục</button></div>)}</section></>}
 
@@ -484,9 +488,7 @@ export function AuditLogs(){
 
       const auth=JSON.parse(sessionStorage.getItem('racehorse.auth')||'{}');
       const token=auth?.accessToken;
-      const url=`${(import.meta.env.VITE_API_URL||'').replace(/\/$/,'')}/api/admin/audit-logs/export?${p}`;
-
-      const res=await fetch(url,{headers:token?{Authorization:`Bearer ${token}`}:{}});
+      const res=await apiFetch(`/api/admin/audit-logs/export?${p}`,{headers:token?{Authorization:`Bearer ${token}`}:{}});
       if(!res.ok)throw new Error('Không thể tải xuống tệp kiểm toán');
       const blob=await res.blob();
       const downloadUrl=window.URL.createObjectURL(blob);
@@ -530,7 +532,7 @@ export function AuditLogs(){
           <span>Phân hệ</span>
           <select value={module} onChange={e=>{setModule(e.target.value);setPage(0)}}>
             <option value="">Tất cả phân hệ</option>
-            {['ACCESS','PROFILE','TRAINING','MEDICAL','STABLE_CARE','RACING','REPORTING'].map(x=>(
+            {['ACCESS','PROFILE','TRAINING','MEDICAL','STABLE_CARE','REPORTING'].map(x=>(
               <option key={x} value={x}>{MODULES[x]||x}</option>
             ))}
           </select>
@@ -898,17 +900,37 @@ export function StablesPage(){
                         </div>
                         {assign ? (
                           <div className="stall-horse-info">
-                            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:'4px'}}>
-                              <b>🐴 {horse ? horse.name : (assign.horseName || 'Ngựa đã phân bổ')}</b>
-                              {isPaid ? (
-                                <span className="badge-payment paid" title="Đã thanh toán phí dịch vụ">✓ Đã trả phí</span>
-                              ) : isOverride ? (
-                                <span className="badge-payment override" title={horse?.overrideReason || "Được Club Manager bảo lãnh"}>⭐ Bảo lãnh</span>
-                              ) : (
-                                <span className="badge-payment unpaid" title="Chưa thanh toán phí dịch vụ">⚠️ Chưa phí</span>
-                              )}
+                            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '4px' }}>
+                              <div className="stall-horse-avatar-wrap" style={{ width: '36px', height: '36px', borderRadius: '6px' }}>
+                                {(assign.photoUrl || horse?.photoUrl) ? (
+                                  <img
+                                    src={assign.photoUrl || horse?.photoUrl}
+                                    alt={horse ? horse.name : assign.horseName}
+                                    className="stall-horse-avatar-img"
+                                    onError={(e) => handleImageFallback(e, 'flex')}
+                                  />
+                                ) : null}
+                                <div
+                                  className="stall-horse-avatar-fallback"
+                                  style={{ display: (assign.photoUrl || horse?.photoUrl) ? 'none' : 'flex' }}
+                                >
+                                  <img src={horseIcon} alt="" className="stall-horse-icon-fallback" style={{ width: '20px', height: '20px' }} />
+                                </div>
+                              </div>
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:'4px'}}>
+                                  <b style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{horse ? horse.name : (assign.horseName || 'Ngựa đã phân bổ')}</b>
+                                  {isPaid ? (
+                                    <span className="badge-payment paid" title="Đã thanh toán phí dịch vụ">✓ Đã trả phí</span>
+                                  ) : isOverride ? (
+                                    <span className="badge-payment override" title={horse?.overrideReason || "Được Club Manager bảo lãnh"}>⭐ Bảo lãnh</span>
+                                  ) : (
+                                    <span className="badge-payment unpaid" title="Chưa thanh toán phí dịch vụ">⚠️ Chưa phí</span>
+                                  )}
+                                </div>
+                                <small>Mã: {horse ? horse.code : (assign.horseCode || assign.horseId?.slice(0,8))}</small>
+                              </div>
                             </div>
-                            <small>Mã: {horse ? horse.code : (assign.horseCode || assign.horseId?.slice(0,8))}</small>
                             <small>Từ ngày: {new Date(assign.assignedFrom).toLocaleDateString('vi-VN')}</small>
                           </div>
                         ) : (
@@ -1819,7 +1841,7 @@ export function InventoryCatalogPage() {
         <div className="card-head"><div><h3>Lịch sử xuất dùng gần đây</h3><p className="muted" style={{margin:'5px 0 0',fontSize:'11px'}}>Mỗi lần xuất dùng trừ số tồn và ghi một khoản chi trong sổ tài chính Club Manager.</p></div></div>
         {!usage.length ? <div className="simple-empty">Chưa ghi nhận lần xuất dùng nào.</div> : <div className="inventory-request-list">
           {usage.map(record => <div className="inventory-request-row" key={record.id}>
-            <div><b>{record.itemName}</b><small>{record.quantity} {record.unit} · còn {record.remainingQuantity} {record.unit} · {record.recordedAt ? new Date(record.recordedAt).toLocaleString('vi-VN') : '—'}</small><p>{record.notes || 'Xuất dùng vật tư'}</p></div>
+            <div><b>{record.itemName}</b><small>{record.quantity} {record.unit} · còn {record.remainingQuantity} {record.unit} · {record.recordedAt ? new Date(record.recordedAt).toLocaleString('vi-VN') : '—'}</small><p>{record.requestedByRole ? `${{ STABLE_STAFF: 'Nhân viên chuồng', VETERINARIAN: 'Thú y', HEAD_TRAINER: 'Huấn luyện viên' }[record.requestedByRole] || record.requestedByRole} · ` : ''}{record.horseId ? `Ngựa ${horses.find(horse => horse.id === record.horseId)?.name || record.horseId} · ` : ''}{record.notes || 'Xuất dùng vật tư'}</p></div>
             <strong>{fmtPrice(record.totalCostVnd)}</strong>
           </div>)}
         </div>}
@@ -1895,9 +1917,9 @@ function ReceiveInventoryModal({ request, items, onClose, onSaved }) {
           {compatibleItems.map(item => <option value={item.id} key={item.id}>{item.itemName} · còn {item.quantityOnHand} {item.unit}</option>)}
         </select>
       </label>}
-      <label className="field"><span>Đơn giá tham chiếu VND / {request.unit}</span><input type="number" min="0.01" step="0.01" value={referencePrice} onChange={e => setReferencePrice(e.target.value)} placeholder="Bỏ trống nếu chưa có giá" /></label>
+      <label className="field"><span>Đơn giá tham chiếu VND / {request.unit}</span><UnitStepNumberInput type="number" min="0.01" step="0.01" value={referencePrice} onChange={e => setReferencePrice(e.target.value)} placeholder="Bỏ trống nếu chưa có giá" /></label>
       {!request.itemId && !catalogItemId && <div className="form-grid">
-        <label className="field"><span>Ngưỡng cảnh báo mặt hàng mới</span><input type="number" min="0" step="0.001" value={minThreshold} onChange={e => setMinThreshold(e.target.value)} /></label>
+        <label className="field"><span>Ngưỡng cảnh báo mặt hàng mới</span><UnitStepNumberInput type="number" min="0" step="0.001" value={minThreshold} onChange={e => setMinThreshold(e.target.value)} /></label>
         <label className="field"><span>Vị trí kho</span><input value={location} onChange={e => setLocation(e.target.value)} /></label>
       </div>}
       {error && <div className="notice error">{error}</div>}
@@ -1941,8 +1963,8 @@ function RecordInventoryUsageModal({ item, horses, stables, onClose, onSaved }) 
     <form className="form-stack" onSubmit={submit}>
       <p className="muted" style={{fontSize:'12px',margin:0}}>Tồn hiện tại: <b>{item.quantityOnHand} {item.unit}</b>. Xác nhận sẽ trừ tồn và ghi chi phí vào sổ tài chính.</p>
       <div className="form-grid">
-        <label className="field"><span>Số lượng sử dụng *</span><input type="number" required min="0.001" max={item.quantityOnHand} step="0.001" value={quantity} onChange={e => setQuantity(e.target.value)} /></label>
-        <label className="field"><span>Đơn giá xuất dùng (VND / {item.unit}) *</span><input type="number" required min="0.01" step="0.01" value={unitPrice} onChange={e => setUnitPrice(e.target.value)} /></label>
+        <label className="field"><span>Số lượng sử dụng *</span><UnitStepNumberInput type="number" required min="0.001" max={item.quantityOnHand} step="0.001" value={quantity} onChange={e => setQuantity(e.target.value)} /></label>
+        <label className="field"><span>Đơn giá xuất dùng (VND / {item.unit}) *</span><UnitStepNumberInput type="number" required min="0.01" step="0.01" value={unitPrice} onChange={e => setUnitPrice(e.target.value)} /></label>
       </div>
       <div className="form-grid">
         <label className="field"><span>Đối tượng sử dụng</span><select value={targetType} onChange={e => {setTargetType(e.target.value);setTargetId('')}}>
@@ -2016,11 +2038,11 @@ function CreateInventoryItemModal({ onClose, onSaved }) {
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'10px'}}>
           <label className="field">
             <span>Số lượng ban đầu</span>
-            <input type="number" min="0" step="0.001" value={form.initialQuantity} onChange={set('initialQuantity')}/>
+            <UnitStepNumberInput type="number" min="0" step="0.001" value={form.initialQuantity} onChange={set('initialQuantity')}/>
           </label>
           <label className="field">
             <span>Ngưỡng an toàn (cảnh báo tồn thấp)</span>
-            <input type="number" min="0" step="0.001" value={form.minThreshold} onChange={set('minThreshold')}/>
+            <UnitStepNumberInput type="number" min="0" step="0.001" value={form.minThreshold} onChange={set('minThreshold')}/>
           </label>
         </div>
         <label className="field">
@@ -2029,7 +2051,7 @@ function CreateInventoryItemModal({ onClose, onSaved }) {
         </label>
         <label className="field">
           <span>Đơn giá tham chiếu (VNĐ)</span>
-          <input type="number" min="0" step="100" value={form.referencePrice} onChange={set('referencePrice')} placeholder="Bỏ trống nếu chưa có"/>
+          <UnitStepNumberInput type="number" min="0" step="100" value={form.referencePrice} onChange={set('referencePrice')} placeholder="Bỏ trống nếu chưa có"/>
         </label>
         <label className="field">
           <span>Mô tả / Ghi chú</span>
@@ -2108,11 +2130,11 @@ function EditInventoryItemModal({ item, onClose, onSaved }) {
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'10px'}}>
           <label className="field">
             <span>Ngưỡng an toàn (cảnh báo tồn thấp)</span>
-            <input type="number" min="0" step="0.001" value={form.minThreshold} onChange={set('minThreshold')}/>
+            <UnitStepNumberInput type="number" min="0" step="0.001" value={form.minThreshold} onChange={set('minThreshold')}/>
           </label>
           <label className="field">
             <span>Đơn giá tham chiếu (VNĐ)</span>
-            <input type="number" min="0" step="100" value={form.referencePrice} onChange={set('referencePrice')} placeholder="Bỏ trống nếu chưa có"/>
+            <UnitStepNumberInput type="number" min="0" step="100" value={form.referencePrice} onChange={set('referencePrice')} placeholder="Bỏ trống nếu chưa có"/>
           </label>
         </div>
         <label className="field">
@@ -2145,3 +2167,6 @@ function EditInventoryItemModal({ item, onClose, onSaved }) {
     </Dialog>
   )
 }
+
+export { default as TaskCatalogPage } from './TaskCatalogPage'
+export { default as ServicePackageCatalogPage } from './ServicePackageCatalogPage'

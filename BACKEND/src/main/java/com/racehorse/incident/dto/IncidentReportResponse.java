@@ -21,6 +21,14 @@ public record IncidentReportResponse(
         UUID resolvedByUserId,
         String resolvedByName,
         OffsetDateTime resolvedAt,
-        String resolutionNotes
+        String resolutionNotes,
+        UUID trainingScheduleId,
+        String trainingTaskName,
+        String groundName,
+        Integer laneNumber,
+        java.util.List<String> recipients,
+        UUID emergencyVetId,
+        String emergencyVetName,
+        UUID emergencyExaminationId
 ) {
 }

@@ -26,18 +26,19 @@ public interface UserAccountRepository extends JpaRepository<UserAccount, UUID> 
 
     @Query("""
             select u from UserAccount u
-            where (:query is null
-                   or lower(u.username) like lower(concat('%', :query, '%'))
-                   or lower(u.email) like lower(concat('%', :query, '%')))
+            where (:matchAll = true
+                   or lower(u.username) like :pattern
+                   or lower(u.email) like :pattern)
             """
             )
-    Page<UserAccount> search(@Param("query") String query, Pageable pageable);
+    Page<UserAccount> search(@Param("matchAll") boolean matchAll,
+                             @Param("pattern") String pattern, Pageable pageable);
 
     @Query(value = """
             select concat('PERM_', rp.module_code, '_', rp.action_code)
-            from user_roles ur
-            join role_permissions rp on rp.role_code = ur.role and rp.granted = 1
-            where ur.user_id = :userId
+            from dbo.user_roles ur
+            join dbo.role_permissions rp on rp.role_code = ur.role and cast(rp.granted as varchar(5)) in ('1', 'true', 't')
+            where ur.user_id = :userId and rp.module_code <> 'RACING'
             """, nativeQuery = true)
     List<String> findGrantedPermissionCodes(@Param("userId") UUID userId);
 

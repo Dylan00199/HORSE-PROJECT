@@ -87,6 +87,36 @@ class CareTaskServiceTest {
     }
 
     @Test
+    void listTasksOmitsArchivedRoutineInstances() {
+        when(jdbc.query(anyString(), any(RowMapper.class), any(Object[].class))).thenReturn(List.of());
+
+        service.listTasks(null, null, null, null, false);
+
+        verify(jdbc).query(contains("WHERE t.task_category <> 'ARCHIVED_ROUTINE'"),
+                any(RowMapper.class), any(Object[].class));
+    }
+
+    @Test
+    void dailyRoutineCreatesSeparateInstanceForEachStaffMember() {
+        LocalDate date = LocalDate.of(2026, 11, 18);
+        UUID staffA = UUID.randomUUID();
+        UUID staffB = UUID.randomUUID();
+        when(jdbc.query(anyString(), any(RowMapper.class), any(Object[].class))).thenReturn(List.of());
+
+        service.listStaffTasks(staffA, date, null, false);
+        service.listStaffTasks(staffB, date, null, false);
+
+        verify(jdbc).update(contains("t.assigned_staff_id=?"), eq(Date.valueOf(date)), eq(staffA),
+                eq(Date.valueOf(date)), eq(staffA));
+        verify(jdbc).update(contains("t.assigned_staff_id=?"), eq(Date.valueOf(date)), eq(staffB),
+                eq(Date.valueOf(date)), eq(staffB));
+        verify(jdbc).query(contains("t.assigned_staff_id = ?"), any(RowMapper.class),
+                eq(new Object[]{staffA, Date.valueOf(date)}));
+        verify(jdbc).query(contains("t.assigned_staff_id = ?"), any(RowMapper.class),
+                eq(new Object[]{staffB, Date.valueOf(date)}));
+    }
+
+    @Test
     void completeTaskUpdatesStatusAndRecordsCompletionDetails() {
         UUID taskId = UUID.randomUUID();
         UUID staffId = UUID.randomUUID();
@@ -99,6 +129,7 @@ class CareTaskServiceTest {
                     when(rs.getString("status")).thenReturn("PENDING");
                     when(rs.getString("task_category")).thenReturn("ROUTINE");
                     when(rs.getString("scope")).thenReturn("FACILITY");
+                    when(rs.getObject("assigned_staff_id", UUID.class)).thenReturn(staffId);
                     when(rs.getDate("scheduled_date")).thenReturn(Date.valueOf(LocalDate.now()));
                     when(rs.getTime("scheduled_time")).thenReturn(Time.valueOf(LocalTime.of(7, 0)));
                     when(rs.getObject("created_at", OffsetDateTime.class)).thenReturn(OffsetDateTime.now());
@@ -107,14 +138,16 @@ class CareTaskServiceTest {
 
         when(jdbc.query(contains("SELECT username FROM dbo.users"), any(RowMapper.class), eq(staffId)))
                 .thenReturn(List.of("stable_groom"));
+        when(jdbc.update(contains("UPDATE dbo.care_tasks"), any(Object[].class))).thenReturn(1);
 
         CompleteCareTaskRequest completeReq = new CompleteCareTaskRequest("Đã dọn sạch", "https://img.example.com/clean.jpg");
 
         service.completeTask(taskId, staffId, completeReq);
 
         verify(jdbc).update(
-                contains("UPDATE dbo.care_tasks"),
-                eq(staffId), eq("stable_groom"), eq("Đã dọn sạch"), eq("https://img.example.com/clean.jpg"), isNull(), isNull(), eq(taskId)
+                contains("photo_bytes = ?"),
+                eq(staffId), eq("stable_groom"), eq("Đã dọn sạch"),
+                eq("https://img.example.com/clean.jpg"), isNull(), isNull(), eq(taskId), eq(staffId)
         );
     }
 
@@ -131,6 +164,7 @@ class CareTaskServiceTest {
                     when(rs.getString("status")).thenReturn("PENDING");
                     when(rs.getString("task_category")).thenReturn("ROUTINE");
                     when(rs.getString("scope")).thenReturn("FACILITY");
+                    when(rs.getObject("assigned_staff_id", UUID.class)).thenReturn(staffId);
                     when(rs.getDate("scheduled_date")).thenReturn(Date.valueOf(LocalDate.now()));
                     when(rs.getTime("scheduled_time")).thenReturn(Time.valueOf(LocalTime.of(7, 0)));
                     when(rs.getObject("created_at", OffsetDateTime.class)).thenReturn(OffsetDateTime.now());
@@ -139,6 +173,7 @@ class CareTaskServiceTest {
 
         when(jdbc.query(contains("SELECT username FROM dbo.users"), any(RowMapper.class), eq(staffId)))
                 .thenReturn(List.of("stable_groom"));
+        when(jdbc.update(contains("UPDATE dbo.care_tasks"), any(Object[].class))).thenReturn(1);
 
         byte[] fakeImage = new byte[] { (byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 0x01 };
         MockMultipartFile file = new MockMultipartFile("file", "evidence.jpg", "image/jpeg", fakeImage);
@@ -149,7 +184,7 @@ class CareTaskServiceTest {
                 contains("UPDATE dbo.care_tasks"),
                 eq(staffId), eq("stable_groom"), eq("Dọn chuồng xong, đã chụp ảnh"),
                 eq("/api/care-tasks/" + taskId + "/photo"),
-                eq(fakeImage), eq("image/jpeg"), eq(taskId)
+                eq(fakeImage), eq("image/jpeg"), eq(taskId), eq(staffId)
         );
     }
 
@@ -240,6 +275,86 @@ class CareTaskServiceTest {
     }
 
     @Test
+    void staffCannotCompleteTaskAssignedToAnotherStaff() {
+        UUID taskId = UUID.randomUUID();
+        UUID actorId = UUID.randomUUID();
+        CareTaskService guarded = spy(service);
+        CareTaskResponse task = mock(CareTaskResponse.class);
+        when(task.status()).thenReturn("PENDING");
+        when(task.taskCategory()).thenReturn("SPECIAL");
+        when(task.assignedStaffId()).thenReturn(UUID.randomUUID());
+        doReturn(task).when(guarded).getTask(taskId);
+
+        assertThatThrownBy(() -> guarded.completeTask(taskId, actorId,
+                new CompleteCareTaskRequest("Xong", null)))
+                .isInstanceOf(BusinessException.class).hasMessageContaining("không được phân công");
+        verify(jdbc, never()).update(contains("UPDATE dbo.care_tasks"), any(Object[].class));
+    }
+
+    @Test
+    void staffCannotCompleteUnassignedSpecialTask() {
+        UUID taskId = UUID.randomUUID();
+        CareTaskService guarded = spy(service);
+        CareTaskResponse task = mock(CareTaskResponse.class);
+        when(task.status()).thenReturn("PENDING");
+        when(task.taskCategory()).thenReturn("SPECIAL");
+        doReturn(task).when(guarded).getTask(taskId);
+
+        assertThatThrownBy(() -> guarded.completeTask(taskId, UUID.randomUUID(),
+                new CompleteCareTaskRequest("Xong", null)))
+                .isInstanceOf(BusinessException.class).hasMessageContaining("không được phân công");
+    }
+
+    @Test
+    void completionRejectsConcurrentStatusChange() {
+        UUID taskId = UUID.randomUUID();
+        UUID actorId = UUID.randomUUID();
+        CareTaskService guarded = spy(service);
+        CareTaskResponse task = mock(CareTaskResponse.class);
+        when(task.status()).thenReturn("PENDING");
+        when(task.assignedStaffId()).thenReturn(actorId);
+        doReturn(task).when(guarded).getTask(taskId);
+        when(jdbc.query(contains("SELECT username FROM dbo.users"), any(RowMapper.class), eq(actorId)))
+                .thenReturn(List.of("staff"));
+        when(jdbc.update(contains("UPDATE dbo.care_tasks"), any(Object[].class))).thenReturn(0);
+
+        assertThatThrownBy(() -> guarded.completeTask(taskId, actorId,
+                new CompleteCareTaskRequest("Xong", null)))
+                .isInstanceOf(BusinessException.class).hasMessageContaining("đã thay đổi trạng thái");
+    }
+
+    @Test
+    void cancelRejectsConcurrentCompletion() {
+        UUID taskId = UUID.randomUUID();
+        CareTaskService guarded = spy(service);
+        CareTaskResponse task = mock(CareTaskResponse.class);
+        when(task.status()).thenReturn("PENDING");
+        doReturn(task).when(guarded).getTask(taskId);
+        when(jdbc.update(contains("status = 'CANCELLED'"), eq(taskId))).thenReturn(0);
+
+        assertThatThrownBy(() -> guarded.cancelTask(taskId, UUID.randomUUID()))
+                .isInstanceOf(BusinessException.class).hasMessageContaining("đã thay đổi trạng thái");
+    }
+
+    @Test
+    void managerCanCompleteAssignedTaskForAbsentStaff() {
+        UUID taskId = UUID.randomUUID();
+        UUID managerId = UUID.randomUUID();
+        CareTaskService guarded = spy(service);
+        CareTaskResponse task = mock(CareTaskResponse.class);
+        when(task.status()).thenReturn("PENDING");
+        when(task.assignedStaffId()).thenReturn(UUID.randomUUID());
+        doReturn(task).when(guarded).getTask(taskId);
+        when(jdbc.query(contains("SELECT username FROM dbo.users"), any(RowMapper.class), eq(managerId)))
+                .thenReturn(List.of("manager"));
+        when(jdbc.update(contains("UPDATE dbo.care_tasks"), any(Object[].class))).thenReturn(1);
+
+        guarded.completeTask(taskId, managerId, new CompleteCareTaskRequest("Xong", null), true);
+        verify(jdbc).update(contains("UPDATE dbo.care_tasks"), eq(managerId),
+                eq("manager"), eq("Xong"), isNull(), isNull(), isNull(), eq(taskId));
+    }
+
+    @Test
     void getTaskThrowsWhenNotFound() {
         UUID taskId = UUID.randomUUID();
         when(jdbc.query(contains("WHERE t.id = ?"), any(RowMapper.class), eq(taskId)))
@@ -320,5 +435,39 @@ class CareTaskServiceTest {
                 tomorrow.isBefore(today), null, null, null, null, null, OffsetDateTime.now()
         );
         assertThat(futureTask.isOverdue()).isFalse();
+    }
+
+    @Test
+    void getTaskPhotoReturnsDataWhenPresent() {
+        UUID taskId = UUID.randomUUID();
+        byte[] bytes = new byte[] { 1, 2, 3 };
+        when(jdbc.query(contains("SELECT photo_bytes"), any(RowMapper.class), eq(taskId)))
+                .thenReturn(List.of(new CareTaskService.TaskPhotoData(bytes, "image/png", "/url", "Title")));
+
+        CareTaskService.TaskPhotoData data = service.getTaskPhoto(taskId);
+        assertThat(data.bytes()).isEqualTo(bytes);
+        assertThat(data.contentType()).isEqualTo("image/png");
+    }
+
+    @Test
+    void getTaskPhotoThrowsNotFoundWhenTaskNotFound() {
+        UUID taskId = UUID.randomUUID();
+        when(jdbc.query(contains("SELECT photo_bytes"), any(RowMapper.class), eq(taskId)))
+                .thenReturn(List.of());
+
+        assertThatThrownBy(() -> service.getTaskPhoto(taskId))
+                .isInstanceOf(ResourceNotFoundException.class)
+                .hasMessageContaining("Không tìm thấy nhiệm vụ");
+    }
+
+    @Test
+    void getTaskPhotoThrowsNotFoundWhenNoPhotoAttached() {
+        UUID taskId = UUID.randomUUID();
+        when(jdbc.query(contains("SELECT photo_bytes"), any(RowMapper.class), eq(taskId)))
+                .thenReturn(List.of(new CareTaskService.TaskPhotoData(null, null, null, "Title")));
+
+        assertThatThrownBy(() -> service.getTaskPhoto(taskId))
+                .isInstanceOf(ResourceNotFoundException.class)
+                .hasMessageContaining("không có ảnh đính kèm");
     }
 }

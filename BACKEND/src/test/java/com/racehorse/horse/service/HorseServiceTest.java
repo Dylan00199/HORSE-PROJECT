@@ -1,12 +1,14 @@
 package com.racehorse.horse.service;
 
 import com.racehorse.common.exception.BusinessException;
+import com.racehorse.common.exception.ResourceNotFoundException;
 import com.racehorse.auth.repository.UserAccountRepository;
 import com.racehorse.auth.entity.Role;
 import com.racehorse.auth.entity.UserAccount;
 import com.racehorse.horse.dto.CreateHorseRequest;
 import com.racehorse.horse.dto.HorseResponse;
 import com.racehorse.horse.dto.ReplaceOwnershipRequest;
+import com.racehorse.horse.dto.UpdateOwnedHorseRequest;
 import com.racehorse.horse.entity.Horse;
 import com.racehorse.horse.entity.HorseGender;
 import com.racehorse.horse.entity.HorseOwnership;
@@ -19,10 +21,15 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.time.Clock;
 import java.time.LocalDate;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.math.BigDecimal;
 import java.util.List;
@@ -49,6 +56,9 @@ class HorseServiceTest {
     @Mock
     private UserAccountRepository userRepository;
 
+    @Mock
+    private JdbcTemplate jdbc;
+
     private HorseService horseService;
 
     @BeforeEach
@@ -58,12 +68,71 @@ class HorseServiceTest {
                 ownershipRepository,
                 userRepository,
                 new HorseMapper(),
-                Clock.fixed(Instant.parse("2026-09-10T00:00:00Z"), ZoneOffset.UTC));
+                Clock.fixed(Instant.parse("2026-09-10T00:00:00Z"), ZoneOffset.UTC), jdbc);
+    }
+
+    @Test
+    void ownerCanRemoveUnpaidHorseWithoutBenefitConfirmation() {
+        UUID horseId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        when(jdbc.queryForList(any(String.class), any(UUID.class), any(UUID.class)))
+                .thenReturn(List.of(java.util.Map.of("active_service_plan", "P30", "payment_status", "UNPAID")));
+
+        horseService.removeForOwner(horseId, ownerId, false);
+
+        verify(jdbc).update(org.mockito.ArgumentMatchers.argThat(sql -> sql.contains("active_service_plan=null")
+                && sql.contains("next_service_plan=null") && sql.contains("payment_status='UNPAID'")),
+                org.mockito.ArgumentMatchers.eq(OffsetDateTime.parse("2026-09-10T00:00:00Z")),
+                org.mockito.ArgumentMatchers.eq(horseId));
+        verify(jdbc).update(org.mockito.ArgumentMatchers.contains("record_type='STALL_ASSIGNMENT'"),
+                any(String.class), any(UUID.class));
+    }
+
+    @Test
+    void activePackageRequiresExplicitBenefitLossConfirmation() {
+        UUID horseId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        when(jdbc.queryForList(any(String.class), any(UUID.class), any(UUID.class))).thenReturn(List.of(java.util.Map.of(
+                "active_service_plan", "P30", "payment_status", "PAID",
+                "paid_until", java.sql.Date.valueOf("2026-09-30"))));
+
+        assertThatThrownBy(() -> horseService.removeForOwner(horseId, ownerId, false))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("không được hoàn tiền");
+        verify(jdbc, never()).update(any(String.class), any(OffsetDateTime.class), any(UUID.class));
+
+        horseService.removeForOwner(horseId, ownerId, true);
+        verify(jdbc).update(any(String.class), any(OffsetDateTime.class), any(UUID.class));
+    }
+
+    @Test
+    void ownerCannotRemoveHorseThatIsNotTheirs() {
+        UUID horseId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        when(jdbc.queryForList(any(String.class), any(UUID.class), any(UUID.class))).thenReturn(List.of());
+
+        assertThatThrownBy(() -> horseService.removeForOwner(horseId, ownerId, true))
+                .isInstanceOf(ResourceNotFoundException.class);
+        verify(jdbc, never()).update(any(String.class), any(OffsetDateTime.class), any(UUID.class));
+    }
+
+    @Test
+    void ownerSearchPassesStatusAndNormalizedTextToRepository() {
+        UUID ownerId = UUID.randomUUID();
+        Pageable pageable = Pageable.unpaged();
+        when(horseRepository.findOwnedBy(ownerId, false, "%bolt%", HorseStatus.PENDING_PAYMENT, pageable))
+                .thenReturn(Page.empty());
+
+        horseService.findOwnedBy(ownerId, "  BOLT  ", HorseStatus.PENDING_PAYMENT, pageable);
+
+        verify(horseRepository).findOwnedBy(ownerId, false, "%bolt%", HorseStatus.PENDING_PAYMENT, pageable);
     }
 
     @Test
     void createNormalizesIdentifiersAndUsesActiveAsDefaultStatus() {
         CreateHorseRequest request = request("  h-001  ", null);
+        when(userRepository.findById(request.initialOwnerId())).thenReturn(Optional.of(
+                new UserAccount("owner", "encoded", "owner@example.com", Set.of(Role.HORSE_OWNER))));
         when(horseRepository.save(any(Horse.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
 
@@ -90,7 +159,7 @@ class HorseServiceTest {
                 null,
                 null,
                 null,
-                "Stable B-01",
+                "",
                 HorseStatus.ACTIVE,
                 ownerId
         );
@@ -106,6 +175,104 @@ class HorseServiceTest {
         assertThat(response.owners().get(0).username()).isEqualTo("owner1");
         assertThat(response.owners().get(0).percentage()).isEqualByComparingTo("100.00");
         verify(ownershipRepository).save(any(HorseOwnership.class));
+    }
+
+    @Test
+    void ownerCannotChooseStallOrPaymentStatusWhenCreatingHorse() {
+        UUID ownerId = UUID.randomUUID();
+        UserAccount owner = new UserAccount("owner", "owner@example.com", "encoded", Set.of(Role.HORSE_OWNER));
+        CreateHorseRequest request = new CreateHorseRequest("H-NEW", "New horse", null,
+                LocalDate.of(2023, 1, 1), HorseGender.STALLION, "Bay", "Thoroughbred",
+                null, null, null, "Other staff's stall", HorseStatus.INJURED, null);
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(horseRepository.save(any(Horse.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        HorseResponse response = horseService.createForOwner(request, ownerId);
+
+        assertThat(response.stableLocation()).isEmpty();
+        assertThat(response.status()).isEqualTo(HorseStatus.PENDING_PAYMENT);
+        assertThat(response.paymentStatus()).isEqualTo("UNPAID");
+    }
+
+    @Test
+    void ownerCanChooseOwnedSireAndDamWhenCreatingHorse() {
+        UUID ownerId = UUID.randomUUID();
+        UUID sireId = UUID.randomUUID();
+        UUID damId = UUID.randomUUID();
+        Horse sire = horseEntity("SIRE");
+        Horse dam = new Horse("DAM", "Dam", null, LocalDate.of(2021, 2, 1),
+                HorseGender.MARE, "Bay", "Thoroughbred", "Stable A", HorseStatus.ACTIVE);
+        CreateHorseRequest request = new CreateHorseRequest("FOAL", "Foal", null,
+                LocalDate.of(2024, 1, 1), HorseGender.MARE, "Bay", "Thoroughbred",
+                sireId, damId, null, null, null, null);
+        when(ownershipRepository.existsByHorseIdAndOwnerId(sireId, ownerId)).thenReturn(true);
+        when(ownershipRepository.existsByHorseIdAndOwnerId(damId, ownerId)).thenReturn(true);
+        when(horseRepository.findById(sireId)).thenReturn(Optional.of(sire));
+        when(horseRepository.findById(damId)).thenReturn(Optional.of(dam));
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(
+                new UserAccount("owner", "encoded", "owner@example.com", Set.of(Role.HORSE_OWNER))));
+        when(horseRepository.save(any(Horse.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        HorseResponse response = horseService.createForOwner(request, ownerId);
+
+        assertThat(response.sire().name()).isEqualTo("Lightning");
+        assertThat(response.dam().name()).isEqualTo("Dam");
+        assertThat(response.status()).isEqualTo(HorseStatus.PENDING_PAYMENT);
+    }
+
+    @Test
+    void ownerCannotChooseAnotherOwnersHorseAsParent() {
+        UUID ownerId = UUID.randomUUID();
+        UUID sireId = UUID.randomUUID();
+        CreateHorseRequest request = new CreateHorseRequest("FOAL", "Foal", null,
+                LocalDate.of(2024, 1, 1), HorseGender.MARE, "Bay", "Thoroughbred",
+                sireId, null, null, null, null, null);
+
+        assertThatThrownBy(() -> horseService.createForOwner(request, ownerId))
+                .isInstanceOf(com.racehorse.common.exception.ResourceNotFoundException.class);
+        verify(horseRepository, never()).save(any(Horse.class));
+    }
+
+    @Test
+    void ownerProfileEditPreservesAssignedStallAndOperationalStatus() {
+        UUID horseId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        Horse horse = horseEntity("H-EDIT");
+        when(horseRepository.findDetailById(horseId)).thenReturn(Optional.of(horse));
+        when(ownershipRepository.existsByHorseIdAndOwnerId(horseId, ownerId)).thenReturn(true);
+        UpdateOwnedHorseRequest request = new UpdateOwnedHorseRequest("Renamed", null,
+                LocalDate.of(2022, 3, 10), HorseGender.STALLION, "White blaze", "Thoroughbred");
+
+        HorseResponse updated = horseService.updateForOwner(horseId, ownerId, request);
+
+        assertThat(updated.name()).isEqualTo("Renamed");
+        assertThat(updated.stableLocation()).isEqualTo("Stable A-01");
+        assertThat(updated.status()).isEqualTo(HorseStatus.ACTIVE);
+    }
+
+    @Test
+    void ownerCanEditPedigreeWithAnOwnedEligibleSire() {
+        UUID horseId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        UUID sireId = UUID.randomUUID();
+        Horse foal = horseEntity("H-EDIT");
+        ReflectionTestUtils.setField(foal, "id", horseId);
+        Horse sire = new Horse("SIRE", "Sire", null, LocalDate.of(2021, 1, 1),
+                HorseGender.STALLION, "Bay", "Thoroughbred", "Stable A-01", HorseStatus.ACTIVE);
+        when(horseRepository.findDetailById(horseId)).thenReturn(Optional.of(foal));
+        when(ownershipRepository.existsByHorseIdAndOwnerId(horseId, ownerId)).thenReturn(true);
+        when(ownershipRepository.existsByHorseIdAndOwnerId(sireId, ownerId)).thenReturn(true);
+        when(horseRepository.findById(sireId)).thenReturn(Optional.of(sire));
+        when(horseRepository.findDetailById(sireId)).thenReturn(Optional.of(sire));
+
+        UpdateOwnedHorseRequest request = new UpdateOwnedHorseRequest("Lightning", null,
+                LocalDate.of(2023, 1, 1), HorseGender.STALLION, "White blaze", "Thoroughbred",
+                sireId, null, null, null, null, null);
+
+        HorseResponse response = horseService.updateForOwner(horseId, ownerId, request);
+
+        assertThat(response.sire()).isNotNull();
+        assertThat(response.sire().name()).isEqualTo("Sire");
     }
 
     @Test
@@ -167,6 +334,157 @@ class HorseServiceTest {
         verify(ownershipRepository, never()).deleteByHorseId(any(UUID.class));
     }
 
+    @Test
+    void unpaidHorseIsHiddenFromVeterinarianAndStableStaffButVisibleToManager() {
+        UUID horseId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        Horse horse = horseEntity("H-UNPAID");
+        ReflectionTestUtils.setField(horse, "id", horseId);
+        horse.setPaymentStatus("UNPAID");
+        when(horseRepository.findDetailById(horseId)).thenReturn(Optional.of(horse));
+
+        assertThatThrownBy(() -> horseService.getByIdForUser(horseId, userId, Role.VETERINARIAN))
+                .isInstanceOf(ResourceNotFoundException.class);
+        assertThatThrownBy(() -> horseService.getByIdForUser(horseId, userId, Role.STABLE_STAFF))
+                .isInstanceOf(ResourceNotFoundException.class);
+        when(ownershipRepository.findByHorseIdOrderByOwnerUsernameAsc(horseId)).thenReturn(List.of());
+        assertThat(horseService.getByIdForUser(horseId, userId, Role.CLUB_MANAGER).id()).isEqualTo(horseId);
+    }
+
+    @Test
+    void paidOrSponsoredHorseIsVisibleToCareRolesButExpiredPlanIsNot() {
+        UUID horseId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        Horse horse = horseEntity("H-PAID");
+        ReflectionTestUtils.setField(horse, "id", horseId);
+        horse.setPaymentStatus("PAID");
+        horse.setIntakeStatus("WAITING_FOR_VET");
+        horse.setPaidUntil(LocalDate.of(2026, 9, 12));
+        when(horseRepository.findDetailById(horseId)).thenReturn(Optional.of(horse));
+        when(ownershipRepository.findByHorseIdOrderByOwnerUsernameAsc(horseId)).thenReturn(List.of());
+
+        assertThat(horseService.getByIdForUser(horseId, userId, Role.VETERINARIAN).id()).isEqualTo(horseId);
+        horse.setPaidUntil(LocalDate.of(2026, 9, 9));
+        assertThatThrownBy(() -> horseService.getByIdForUser(horseId, userId, Role.STABLE_STAFF))
+                .isInstanceOf(ResourceNotFoundException.class);
+        horse.setServiceOverride(true);
+        assertThat(horseService.getByIdForUser(horseId, userId, Role.STABLE_STAFF).id()).isEqualTo(horseId);
+    }
+
+    @Test
+    void trainerCannotOpenAnotherTrainersHorseByGuessingItsId() {
+        UUID horseId = UUID.randomUUID();
+        Horse horse = horseEntity("H-TRAINER");
+        ReflectionTestUtils.setField(horse, "id", horseId);
+        horse.setPaymentStatus("PAID");
+        when(horseRepository.findDetailById(horseId)).thenReturn(Optional.of(horse));
+
+        assertThatThrownBy(() -> horseService.getByIdForUser(horseId, UUID.randomUUID(), Role.HEAD_TRAINER))
+                .isInstanceOf(ResourceNotFoundException.class);
+    }
+
+    @Test
+    void createRejectsMissingInitialOwner() {
+        CreateHorseRequest request = new CreateHorseRequest(
+                "H-NO-OWNER", "Horse Without Owner", null, LocalDate.of(2023, 1, 1),
+                HorseGender.STALLION, "Bay", "Thoroughbred", null, null, null, "", HorseStatus.ACTIVE, null);
+
+        assertThatThrownBy(() -> horseService.create(request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Mỗi ngựa phải có đúng một chủ sở hữu");
+        verify(horseRepository, never()).save(any(Horse.class));
+    }
+
+    @Test
+    void oneOwnerCanOwnMultipleHorses() {
+        UUID ownerId = UUID.randomUUID();
+        UserAccount owner = new UserAccount("ownerMultiple", "encoded", "owner@example.com", Set.of(Role.HORSE_OWNER));
+        when(userRepository.findById(ownerId)).thenReturn(Optional.of(owner));
+        when(horseRepository.save(any(Horse.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        CreateHorseRequest horse1 = new CreateHorseRequest(
+                "H-O1", "Horse One", null, LocalDate.of(2022, 1, 1),
+                HorseGender.STALLION, "Bay", "Thoroughbred", null, null, null, "", HorseStatus.ACTIVE, ownerId);
+        CreateHorseRequest horse2 = new CreateHorseRequest(
+                "H-O2", "Horse Two", null, LocalDate.of(2023, 2, 2),
+                HorseGender.MARE, "Chestnut", "Arabian", null, null, null, "", HorseStatus.ACTIVE, ownerId);
+
+        HorseResponse r1 = horseService.create(horse1);
+        HorseResponse r2 = horseService.create(horse2);
+
+        assertThat(r1.owners()).hasSize(1);
+        assertThat(r1.owners().get(0).username()).isEqualTo("ownerMultiple");
+        assertThat(r2.owners()).hasSize(1);
+        assertThat(r2.owners().get(0).username()).isEqualTo("ownerMultiple");
+    }
+
+    @Test
+    void replaceOwnershipRejectsMultipleOwners() {
+        UUID horseId = UUID.randomUUID();
+        ReplaceOwnershipRequest request = new ReplaceOwnershipRequest(
+                true,
+                List.of(
+                        new ReplaceOwnershipRequest.OwnerShare(UUID.randomUUID(), new BigDecimal("50.00")),
+                        new ReplaceOwnershipRequest.OwnerShare(UUID.randomUUID(), new BigDecimal("50.00"))));
+
+        assertThatThrownBy(() -> horseService.replaceOwnership(horseId, request))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Mỗi ngựa phải có đúng một chủ sở hữu");
+        verify(ownershipRepository, never()).deleteByHorseId(any(UUID.class));
+    }
+
+    @Test
+    void replaceOwnershipReplacesSingleOwnerSuccessfully() {
+        UUID horseId = UUID.randomUUID();
+        UUID newOwnerId = UUID.randomUUID();
+        Horse horse = horseEntity("H-REPLACE");
+        UserAccount newOwner = new UserAccount("newOwner", "encoded", "new@example.com", Set.of(Role.HORSE_OWNER));
+
+        when(horseRepository.findDetailById(horseId)).thenReturn(Optional.of(horse));
+        when(userRepository.findById(newOwnerId)).thenReturn(Optional.of(newOwner));
+
+        ReplaceOwnershipRequest request = new ReplaceOwnershipRequest(
+                true,
+                List.of(new ReplaceOwnershipRequest.OwnerShare(newOwnerId, new BigDecimal("100.00"))));
+
+        HorseResponse response = horseService.replaceOwnership(horseId, request);
+
+        assertThat(response).isNotNull();
+        verify(ownershipRepository).deleteByHorseId(horseId);
+        verify(ownershipRepository).saveAll(any());
+    }
+
+    @Test
+    void currentTrainerCanViewAssignedHorseBeforeStallAssignment() {
+        UUID horseId = UUID.randomUUID();
+        UUID trainerId = UUID.randomUUID();
+        Horse horse = horseEntity("H-PENDING-STALL");
+        UserAccount trainer = new UserAccount("trainer", "trainer@example.com", "encoded", Set.of(Role.HEAD_TRAINER));
+        ReflectionTestUtils.setField(horse, "id", horseId);
+        ReflectionTestUtils.setField(trainer, "id", trainerId);
+        ReflectionTestUtils.setField(horse, "currentTrainer", trainer);
+        horse.setIntakeStatus("PENDING_STALL");
+        horse.setPaymentStatus("PAID");
+        when(horseRepository.findDetailById(horseId)).thenReturn(Optional.of(horse));
+        when(ownershipRepository.findByHorseIdOrderByOwnerUsernameAsc(horseId)).thenReturn(List.of());
+
+        assertThat(horseService.getByIdForUser(horseId, trainerId, Role.HEAD_TRAINER).id()).isEqualTo(horseId);
+        assertThatThrownBy(() -> horseService.getByIdForUser(horseId, UUID.randomUUID(), Role.HEAD_TRAINER))
+                .isInstanceOf(ResourceNotFoundException.class);
+    }
+
+    @Test
+    void toResponseIncludesInternalHealthStatus() {
+        Horse horse = horseEntity("H-FIT-001");
+        ReflectionTestUtils.setField(horse, "healthStatus", "FIT");
+        HorseResponse response = new HorseMapper().toResponse(horse);
+        assertThat(response.healthStatus()).isEqualTo("FIT");
+
+        ReflectionTestUtils.setField(horse, "healthStatus", "INJURED");
+        HorseResponse injuredResponse = new HorseMapper().toResponse(horse);
+        assertThat(injuredResponse.healthStatus()).isEqualTo("INJURED");
+    }
+
     private CreateHorseRequest request(String code, HorseStatus status) {
         return new CreateHorseRequest(
                 code,
@@ -179,8 +497,9 @@ class HorseServiceTest {
                 null,
                 null,
                 null,
-                "Stable A-01",
-                status);
+                "",
+                status,
+                UUID.fromString("00000000-0000-0000-0000-000000000001"));
     }
 
     private Horse horseEntity(String code) {

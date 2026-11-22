@@ -23,9 +23,17 @@ public class OwnerReportController {
     public OwnerReportController(OwnerReportService service){this.service=service;}
 
     @GetMapping("/owners")
-    @PreAuthorize("hasRole('CLUB_MANAGER') and hasAuthority('PERM_REPORTING_VIEW')")
+    @PreAuthorize("hasAuthority('PERM_REPORTING_VIEW') or hasRole('CLUB_MANAGER')")
     public List<OwnerReportService.OwnerOption> owners() {
         return service.getOwners();
+    }
+
+    @GetMapping("/my-expenses")
+    @PreAuthorize("hasRole('HORSE_OWNER')")
+    OwnerReportService.ExpenseOverview myExpenses(@AuthenticationPrincipal Jwt jwt,
+            @RequestParam(required=false) @DateTimeFormat(iso=DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(required=false) @DateTimeFormat(iso=DateTimeFormat.ISO.DATE) LocalDate to) {
+        return service.myExpenses(user(jwt), from, to);
     }
 
     @GetMapping
@@ -50,7 +58,7 @@ public class OwnerReportController {
     }
 
     @PostMapping @ResponseStatus(HttpStatus.CREATED)
-    @PreAuthorize("hasRole('CLUB_MANAGER') and hasAuthority('PERM_REPORTING_EDIT')")
+    @PreAuthorize("hasAuthority('PERM_REPORTING_EDIT') or hasRole('CLUB_MANAGER')")
     OwnerReportService.ReportView generate(@AuthenticationPrincipal Jwt jwt,@Valid @RequestBody GenerateRequest r){
         return service.generate(r.ownerId(),r.periodStart(),r.periodEnd(),user(jwt));
     }

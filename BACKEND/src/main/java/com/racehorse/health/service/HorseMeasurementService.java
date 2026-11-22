@@ -23,15 +23,17 @@ public class HorseMeasurementService {
     public HorseWeightResponse addWeight(UUID horseId, UUID veterinarianId, CreateHorseWeightRequest request) {
         access.requireActive(horseId);
         UUID id=UUID.randomUUID();
-        jdbc.update("insert into horse_weight_records(id,horse_id,measured_by_user_id,weight_kg,measured_at,notes) values(?,?,?,?,?,?)",
-                id,horseId,veterinarianId,request.weightKg(),request.measuredAt(),request.notes());
+        jdbc.update("update horses set weight_kg=?,weight_record_id=?,weight_measured_at=?,"
+                        + "weight_measured_by_user_id=?,weight_notes=?,updated_at=CURRENT_TIMESTAMP,version=version+1 where id=?",
+                request.weightKg(),id,request.measuredAt(),veterinarianId,request.notes(),horseId);
         return new HorseWeightResponse(id,horseId,veterinarianId,request.weightKg(),request.measuredAt(),request.notes());
     }
 
     @Transactional(readOnly=true)
     public List<HorseWeightResponse> weights(UUID horseId, UUID userId, boolean privileged) {
         access.requireReadable(horseId,userId,privileged);
-        return jdbc.query("select id,horse_id,measured_by_user_id,weight_kg,measured_at,notes from horse_weight_records where horse_id=? order by measured_at desc",
+        return jdbc.query("select weight_record_id, id, weight_measured_by_user_id, weight_kg, weight_measured_at, weight_notes "
+                        + "from horses where id=? and weight_kg is not null",
                 this::weight,horseId);
     }
 
@@ -43,19 +45,20 @@ public class HorseMeasurementService {
         if (!"FIT".equals(health)) failed.add("Trạng thái sức khỏe phải là FIT");
         Integer lockCount=jdbc.queryForObject("select count(*) from training_locks where horse_id=? and released_at is null",Integer.class,horseId);
         if (lockCount!=null && lockCount>0) failed.add("Ngựa đang bị khóa huấn luyện");
-        String fitness=firstString("select top 1 fitness_status from training_evaluations where horse_id=? order by session_date desc,completed_at desc",horseId);
+        String fitness=firstString("select fitness_status from training_evaluations where horse_id=? order by session_date desc,completed_at desc limit 1",horseId);
         if (!"GREEN".equals(fitness)) failed.add("Đánh giá thể lực gần nhất phải là GREEN");
         Integer restingHr=firstInteger("""
-                select top 1 tr.heart_rate_bpm from telemetry_readings tr
+                select tr.heart_rate_bpm from telemetry_readings tr
                 join telemetry_sessions ts on ts.id=tr.telemetry_session_id
                 where ts.horse_id=? and ts.measurement_context='RESTING' and tr.heart_rate_bpm is not null
                 order by tr.recorded_at desc
+                limit 1
                 """,horseId);
         if (restingHr==null || restingHr<30 || restingHr>42) failed.add("Nhịp tim nghỉ phải trong khoảng 30-42 bpm");
-        BigDecimal weight=firstDecimal("select top 1 weight_kg from horse_weight_records where horse_id=? order by measured_at desc",horseId);
+        BigDecimal weight=firstDecimal("select weight_kg from horses where id=?",horseId);
         if (weight==null) failed.add("Chưa có cân nặng do bác sĩ thú y nhập");
         if (raceEventId!=null) {
-            List<Map<String,Object>> event=jdbc.queryForList("select minimum_weight_kg,maximum_weight_kg from race_events where id=? and is_active=1",raceEventId);
+            List<Map<String,Object>> event=jdbc.queryForList("select minimum_weight_kg,maximum_weight_kg from race_events where id=? and is_active=true",raceEventId);
             if (event.isEmpty()) throw new ResourceNotFoundException("Không tìm thấy giải đua: "+raceEventId);
             BigDecimal min=(BigDecimal)event.getFirst().get("minimum_weight_kg"), max=(BigDecimal)event.getFirst().get("maximum_weight_kg");
             if (weight!=null && min!=null && weight.compareTo(min)<0) failed.add("Cân nặng thấp hơn mức tối thiểu của giải");
@@ -70,9 +73,34 @@ public class HorseMeasurementService {
         String status=request.status().trim().toUpperCase(Locale.ROOT);
         if(!Set.of("FIT","MONITOR","INJURED","QUARANTINED").contains(status))
             throw new com.racehorse.common.exception.BusinessException("status chỉ nhận FIT, MONITOR, INJURED hoặc QUARANTINED");
+        if ("FIT".equals(status)) {
+            Integer activeInjuries = jdbc.queryForObject(
+                    "select count(*) from module_records where horse_id=? and module_code='MEDICAL' "
+                            + "and record_type in ('INJURY_MARKER','INJURY') and status not in ('HEALED','RESOLVED')",
+                    Integer.class, horseId);
+            if (activeInjuries != null && activeInjuries > 0)
+                throw new com.racehorse.common.exception.BusinessException("Cần xác nhận tất cả chấn thương đã bình phục trước khi chuyển thể trạng sang khỏe mạnh");
+        }
         String source=request.sourceType()==null||request.sourceType().isBlank()?"MANUAL":request.sourceType().trim().toUpperCase(Locale.ROOT);
-        jdbc.update("update horses set health_status=?,health_changed_by_user_id=?,health_source_type=?,health_source_id=?,health_changed_at=SYSDATETIMEOFFSET(),updated_at=SYSDATETIMEOFFSET(),version=version+1 where id=?",
+        jdbc.update("update horses set health_status=?,health_changed_by_user_id=?,health_source_type=?,health_source_id=?,health_changed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,version=version+1 where id=?",
                 status,veterinarianId,source,request.sourceId(),horseId);
+
+        if ("INJURED".equals(status)) {
+            Integer activeLocks = jdbc.queryForObject(
+                    "select count(*) from training_locks where horse_id=? and released_at is null",
+                    Integer.class, horseId);
+            if (activeLocks == null || activeLocks == 0) {
+                jdbc.update(
+                        "insert into training_locks(id,horse_id,reason,review_date,locked_by_user_id,locked_at) values(?,?,?,?,?,CURRENT_TIMESTAMP)",
+                        UUID.randomUUID(), horseId, "Tự động khóa: Thể trạng chuyển sang INJURED", null, veterinarianId);
+            }
+        } else if ("FIT".equals(status)) {
+            jdbc.update(
+                    "update training_locks set released_at=CURRENT_TIMESTAMP, released_by_user_id=?, release_reason=? "
+                            + "where horse_id=? and released_at is null and (reason like 'Tự động khóa:%' or reason like 'Khóa tự động từ kết quả khám:%')",
+                    veterinarianId, "Tự động gỡ khóa: Bác sĩ thú y xác nhận thể trạng FIT", horseId);
+        }
+
         return healthStatus(horseId,veterinarianId,true);
     }
 

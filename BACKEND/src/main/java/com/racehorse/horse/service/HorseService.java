@@ -9,19 +9,27 @@ import com.racehorse.horse.dto.CreateHorseRequest;
 import com.racehorse.horse.dto.HorseResponse;
 import com.racehorse.horse.dto.ReplaceOwnershipRequest;
 import com.racehorse.horse.dto.UpdateHorseRequest;
+import com.racehorse.horse.dto.UpdateOwnedHorseRequest;
 import com.racehorse.horse.entity.Horse;
+import com.racehorse.horse.entity.HorseGender;
 import com.racehorse.horse.entity.HorseOwnership;
 import com.racehorse.horse.entity.HorseStatus;
 import com.racehorse.horse.mapper.HorseMapper;
 import com.racehorse.horse.repository.HorseOwnershipRepository;
 import com.racehorse.horse.repository.HorseRepository;
+import com.racehorse.notification.entity.NotificationPriority;
+import com.racehorse.notification.service.NotificationService;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.Clock;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.HashSet;
 import java.util.Arrays;
 import java.util.List;
@@ -36,31 +44,59 @@ public class HorseService {
     private final UserAccountRepository userRepository;
     private final HorseMapper horseMapper;
     private final Clock clock;
+    private final JdbcTemplate jdbc;
+    private final NotificationService notifications;
 
+    @Autowired
     public HorseService(
             HorseRepository horseRepository,
             HorseOwnershipRepository ownershipRepository,
             UserAccountRepository userRepository,
             HorseMapper horseMapper,
-            Clock clock) {
+            Clock clock,
+            JdbcTemplate jdbc,
+            NotificationService notifications) {
         this.horseRepository = horseRepository;
         this.ownershipRepository = ownershipRepository;
         this.userRepository = userRepository;
         this.horseMapper = horseMapper;
         this.clock = clock;
+        this.jdbc = jdbc;
+        this.notifications = notifications;
+    }
+
+    public HorseService(HorseRepository horseRepository, HorseOwnershipRepository ownershipRepository,
+                        UserAccountRepository userRepository, HorseMapper horseMapper, Clock clock, JdbcTemplate jdbc) {
+        this(horseRepository, ownershipRepository, userRepository, horseMapper, clock, jdbc, null);
+    }
+
+    public HorseService(HorseRepository horseRepository, HorseOwnershipRepository ownershipRepository,
+                        UserAccountRepository userRepository, HorseMapper horseMapper, Clock clock) {
+        this(horseRepository, ownershipRepository, userRepository, horseMapper, clock, null, null);
     }
 
     @Transactional
     public HorseResponse create(CreateHorseRequest request) {
+        if (request.currentTrainerId() != null || request.stableLocation() != null && !request.stableLocation().isBlank()) {
+            throw new BusinessException("Huấn luyện viên và ô chuồng chỉ được phân công sau quy trình tiếp nhận y tế");
+        }
+        if (request.initialOwnerId() == null) {
+            throw new BusinessException("Mỗi ngựa phải có đúng một chủ sở hữu");
+        }
         validateUniqueIdentifiers(request);
         validateDistinctParents(request.sireId(), request.damId());
+        validateManualParents(request.sireId(), request.sireManualName(), request.sireManualId(),
+                request.damId(), request.damManualName(), request.damManualId());
 
-        Horse sire = findOptionalParent(request.sireId(), "Không tìm thấy ngựa bố");
-        Horse dam = findOptionalParent(request.damId(), "Không tìm thấy ngựa mẹ");
+        Horse sire = findOwnedParent(request.sireId(), request.initialOwnerId(), HorseGender.STALLION,
+                request.birthDate(), "ngựa cha");
+        Horse dam = findOwnedParent(request.damId(), request.initialOwnerId(), HorseGender.MARE,
+                request.birthDate(), "ngựa mẹ");
 
         Horse horse = horseMapper.toEntity(request);
         horse.assignParents(sire, dam);
-        horse.assignCurrentTrainer(findTrainer(request.currentTrainerId()));
+        horse.assignManualParents(trimToNull(request.sireManualName()), trimToNull(request.sireManualId()),
+                trimToNull(request.damManualName()), trimToNull(request.damManualId()));
         Horse saved = horseRepository.save(horse);
 
         if (request.initialOwnerId() != null) {
@@ -73,11 +109,42 @@ public class HorseService {
         return toResponse(saved);
     }
 
+    @Transactional
+    public HorseResponse createForOwner(CreateHorseRequest request, UUID ownerId) {
+        validateUniqueIdentifiers(request);
+        if (request.currentTrainerId() != null || request.initialOwnerId() != null) {
+            throw new BusinessException("Chủ ngựa không được tự gán huấn luyện viên hoặc chủ sở hữu khác");
+        }
+        validateDistinctParents(request.sireId(), request.damId());
+        validateManualParents(request.sireId(), request.sireManualName(), request.sireManualId(),
+                request.damId(), request.damManualName(), request.damManualId());
+        Horse sire = findOwnedParent(request.sireId(), ownerId, HorseGender.STALLION, request.birthDate(), "ngựa cha");
+        Horse dam = findOwnedParent(request.damId(), ownerId, HorseGender.MARE, request.birthDate(), "ngựa mẹ");
+        UserAccount owner = findUserWithRole(ownerId, Role.HORSE_OWNER, "Chủ sở hữu");
+        Horse horse = horseMapper.toEntityForOwner(request);
+        horse.assignParents(sire, dam);
+        horse.assignManualParents(trimToNull(request.sireManualName()), trimToNull(request.sireManualId()),
+                trimToNull(request.damManualName()), trimToNull(request.damManualId()));
+        Horse saved = horseRepository.save(horse);
+        HorseOwnership ownership = new HorseOwnership(saved, owner, new BigDecimal("100.00"));
+        ownershipRepository.save(ownership);
+        return horseMapper.toResponse(saved, List.of(ownership));
+    }
+
     @Transactional(readOnly = true)
-    public HorseResponse getByIdForUser(UUID id, UUID userId, boolean privileged) {
+    public HorseResponse getByIdForUser(UUID id, UUID userId, Role role) {
         Horse horse = findHorse(id);
-        if (!privileged && (horse.getArchivedAt() != null
-                || !ownershipRepository.existsByHorseIdAndOwnerId(id, userId))) {
+        boolean allowed = switch (role) {
+            case CLUB_MANAGER -> true;
+            case HEAD_TRAINER -> horse.getArchivedAt() == null
+                    && horse.getCurrentTrainer() != null && userId.equals(horse.getCurrentTrainer().getId());
+            case VETERINARIAN -> horse.getArchivedAt() == null && isServiceVisible(horse)
+                    && Set.of("WAITING_FOR_VET", "IN_MEDICAL", "PENDING_STALL", "STABLED").contains(horse.getIntakeStatus());
+            case STABLE_STAFF -> horse.getArchivedAt() == null && isServiceVisible(horse);
+            case HORSE_OWNER -> horse.getArchivedAt() == null
+                    && ownershipRepository.existsByHorseIdAndOwnerId(id, userId);
+        };
+        if (!allowed) {
             throw new ResourceNotFoundException("Không tìm thấy ngựa được phép truy cập: " + id);
         }
         return toResponse(horse);
@@ -85,21 +152,80 @@ public class HorseService {
 
     @Transactional(readOnly = true)
     public Page<HorseResponse> search(String query, HorseStatus status, Pageable pageable) {
-        String normalizedQuery = query == null || query.isBlank() ? null : query.trim();
-        return horseRepository.search(normalizedQuery, status, pageable)
+        return search(query, status, false, pageable);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<HorseResponse> search(String query, HorseStatus status, boolean paidOnly, Pageable pageable) {
+        String pattern = searchPattern(query);
+        boolean matchAll = query == null || query.isBlank();
+        return (paidOnly
+                ? horseRepository.searchPaidOnly(matchAll, pattern, status, serviceToday(), pageable)
+                : horseRepository.search(matchAll, pattern, status, pageable))
                 .map(this::toResponse);
     }
 
     @Transactional(readOnly = true)
-    public Page<HorseResponse> findOwnedBy(UUID ownerId, Pageable pageable) {
-        return horseRepository.findOwnedBy(ownerId, pageable).map(this::toResponse);
+    public Page<HorseResponse> searchForTrainer(String query, HorseStatus status, UUID trainerId, Pageable pageable) {
+        String pattern = searchPattern(query);
+        return horseRepository.searchForTrainer(query == null || query.isBlank(), pattern, status, trainerId, pageable)
+                .map(this::toResponse);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<HorseResponse> searchForVeterinarian(String query, HorseStatus status, Pageable pageable) {
+        String pattern = searchPattern(query);
+        return horseRepository.searchForVeterinarian(query == null || query.isBlank(), pattern, status, serviceToday(), pageable)
+                .map(this::toResponse);
+    }
+
+    @Transactional(readOnly = true)
+    public List<HorseResponse> getEligibleForMedical() {
+        return horseRepository.findEligibleForMedical(serviceToday()).stream()
+                .map(this::toResponse)
+                .toList();
+    }
+
+    private LocalDate serviceToday() {
+        return LocalDate.now(clock.withZone(ZoneId.of("Asia/Ho_Chi_Minh")));
+    }
+
+    private String searchPattern(String query) {
+        return query == null || query.isBlank()
+                ? "%"
+                : "%" + query.trim().toLowerCase(java.util.Locale.ROOT) + "%";
+    }
+
+    private boolean isServiceVisible(Horse horse) {
+        if (Boolean.TRUE.equals(horse.getServiceOverride())) return true;
+        if (!"PAID".equals(horse.getPaymentStatus())) return false;
+        return horse.getPaidUntil() == null || !horse.getPaidUntil().isBefore(serviceToday());
+    }
+
+    @Transactional(readOnly = true)
+    public Page<HorseResponse> findOwnedBy(UUID ownerId, String query, HorseStatus status, Pageable pageable) {
+        return horseRepository.findOwnedBy(ownerId, query == null || query.isBlank(), searchPattern(query), status, pageable)
+                .map(this::toResponse);
     }
 
     @Transactional
     public HorseResponse update(UUID id, UpdateHorseRequest request) {
         Horse horse = findHorse(id);
+        UUID existingTrainerId = horse.getCurrentTrainer() == null ? null : horse.getCurrentTrainer().getId();
+        if (!java.util.Objects.equals(request.currentTrainerId(), existingTrainerId)
+                || !java.util.Objects.equals(request.stableLocation() == null ? "" : request.stableLocation(), horse.getStableLocation())) {
+            throw new BusinessException("Không thể phân chuồng hoặc gán HLV qua API sửa hồ sơ; dùng quy trình tiếp nhận");
+        }
         validateDistinctParents(request.sireId(), request.damId());
-        validateParentCycle(horse, request.sireId(), request.damId());
+        validateManualParents(request.sireId(), request.sireManualName(), request.sireManualId(),
+                request.damId(), request.damManualName(), request.damManualId());
+
+        UUID ownerId = soleOwnerId(horse);
+        boolean sireChanged = parentChanged(horse.getSire(), horse.getSireManualName(), horse.getSireManualId(),
+                request.sireId(), request.sireManualName(), request.sireManualId());
+        boolean damChanged = parentChanged(horse.getDam(), horse.getDamManualName(), horse.getDamManualId(),
+                request.damId(), request.damManualName(), request.damManualId());
+        if (sireChanged || damChanged) validateParentCycle(horse, request.sireId(), request.damId());
 
         String chip = normalizeNullable(request.microchipPassportNumber());
         if (chip != null
@@ -107,8 +233,10 @@ public class HorseService {
             throw new BusinessException("Số chip/hộ chiếu đã tồn tại: " + chip);
         }
 
-        Horse sire = findOptionalParent(request.sireId(), "Không tìm thấy ngựa bố");
-        Horse dam = findOptionalParent(request.damId(), "Không tìm thấy ngựa mẹ");
+        Horse sire = sireChanged ? findEditableParent(request.sireId(), ownerId, HorseGender.STALLION,
+                request.birthDate(), "ngựa cha") : horse.getSire();
+        Horse dam = damChanged ? findEditableParent(request.damId(), ownerId, HorseGender.MARE,
+                request.birthDate(), "ngựa mẹ") : horse.getDam();
         horse.update(
                 request.name().trim(),
                 chip,
@@ -116,17 +244,65 @@ public class HorseService {
                 request.gender(),
                 request.colorMarkings().trim(),
                 request.breed().trim(),
-                request.stableLocation().trim(),
+                horse.getStableLocation(),
                 request.status());
         horse.assignParents(sire, dam);
-        horse.assignCurrentTrainer(findTrainer(request.currentTrainerId()));
+        horse.assignManualParents(trimToNull(request.sireManualName()), trimToNull(request.sireManualId()),
+                trimToNull(request.damManualName()), trimToNull(request.damManualId()));
+        notifyResponsible(horse);
         return toResponse(horse);
+    }
+
+    @Transactional
+    public HorseResponse updateForOwner(UUID id, UUID ownerId, UpdateOwnedHorseRequest request) {
+        Horse horse = findHorse(id);
+        if (horse.getArchivedAt() != null || !ownershipRepository.existsByHorseIdAndOwnerId(id, ownerId))
+            throw new ResourceNotFoundException("Không tìm thấy ngựa được phép chỉnh sửa: " + id);
+        validateDistinctParents(request.sireId(), request.damId());
+        validateManualParents(request.sireId(), request.sireManualName(), request.sireManualId(),
+                request.damId(), request.damManualName(), request.damManualId());
+        boolean sireChanged = parentChanged(horse.getSire(), horse.getSireManualName(), horse.getSireManualId(),
+                request.sireId(), request.sireManualName(), request.sireManualId());
+        boolean damChanged = parentChanged(horse.getDam(), horse.getDamManualName(), horse.getDamManualId(),
+                request.damId(), request.damManualName(), request.damManualId());
+        if (sireChanged || damChanged) validateParentCycle(horse, request.sireId(), request.damId());
+        Horse sire = sireChanged ? findEditableParent(request.sireId(), ownerId, HorseGender.STALLION,
+                request.birthDate(), "ngựa cha") : horse.getSire();
+        Horse dam = damChanged ? findEditableParent(request.damId(), ownerId, HorseGender.MARE,
+                request.birthDate(), "ngựa mẹ") : horse.getDam();
+        String chip = normalizeNullable(request.microchipPassportNumber());
+        if (chip != null && horseRepository.existsByMicrochipPassportNumberIgnoreCaseAndIdNot(chip, id))
+            throw new BusinessException("Số chip/hộ chiếu đã tồn tại: " + chip);
+        horse.update(request.name().trim(), chip, request.birthDate(), request.gender(),
+                request.colorMarkings().trim(), request.breed().trim(),
+                horse.getStableLocation(), horse.getStatus());
+        horse.assignParents(sire, dam);
+        horse.assignManualParents(trimToNull(request.sireManualName()), trimToNull(request.sireManualId()),
+                trimToNull(request.damManualName()), trimToNull(request.damManualId()));
+        notifyResponsible(horse);
+        return toResponse(horse);
+    }
+
+    private void notifyResponsible(Horse horse) {
+        if (notifications == null) return;
+        UUID changeId = UUID.randomUUID();
+        Set<UUID> sent = new HashSet<>();
+        for (UserAccount recipient : Arrays.asList(horse.getCurrentTrainer(), horse.getCaretaker(),
+                horse.getDiagnosingVet()).stream().filter(java.util.Objects::nonNull).toList()) {
+            if (recipient.getId() != null && sent.add(recipient.getId()))
+                notifications.createDeduplicated(recipient, "HORSE_PROFILE_UPDATED", NotificationPriority.NORMAL,
+                        "Hồ sơ ngựa đã được cập nhật", horse.getCode() + " - " + horse.getName(),
+                        "HORSE", horse.getId(), "HORSE_PROFILE_UPDATED_" + changeId + "_" + recipient.getId());
+        }
     }
 
     @Transactional
     public HorseResponse replaceOwnership(UUID horseId, ReplaceOwnershipRequest request) {
         if (!request.confirmed()) {
             throw new BusinessException("Phải xác nhận trước khi thay đổi tỷ lệ sở hữu");
+        }
+        if (request.owners().size() != 1) {
+            throw new BusinessException("Mỗi ngựa phải có đúng một chủ sở hữu");
         }
         Horse horse = findHorse(horseId);
         Set<UUID> uniqueOwnerIds = new HashSet<>();
@@ -160,6 +336,37 @@ public class HorseService {
         return toResponse(horse);
     }
 
+    @Transactional
+    public void removeForOwner(UUID horseId, UUID ownerId, boolean confirmBenefitLoss) {
+        List<java.util.Map<String, Object>> rows = jdbc.queryForList(
+                "select active_service_plan,paid_until,payment_status from horses "
+                        + "where id=? and archived_at is null and exists ("
+                        + "select 1 from horse_ownerships where horse_id=horses.id and owner_id=?) for update",
+                horseId, ownerId);
+        if (rows.isEmpty()) {
+            throw new ResourceNotFoundException("Không tìm thấy ngựa thuộc sở hữu của bạn");
+        }
+        java.util.Map<String, Object> row = rows.getFirst();
+        java.sql.Date paidUntil = (java.sql.Date) row.get("paid_until");
+        boolean hasRemainingBenefits = row.get("active_service_plan") != null
+                && "PAID".equals(row.get("payment_status"))
+                && (paidUntil == null || !paidUntil.toLocalDate().isBefore(serviceToday()));
+        if (hasRemainingBenefits && !confirmBenefitLoss) {
+            throw new BusinessException("Ngựa đang trong gói dịch vụ. Xóa ngựa sẽ mất toàn bộ quyền lợi còn lại và không được hoàn tiền, kể cả khi gói vẫn còn thời hạn. Vui lòng xác nhận để tiếp tục.");
+        }
+        java.time.Instant removedAt = clock.instant();
+        jdbc.update("update horses set archived_at=?,active_service_plan=null,next_service_plan=null,"
+                        + "service_plan_started_on=null,service_next_due_date=null,paid_until=null,"
+                        + "payment_status='UNPAID',service_override=false,override_reason=null,"
+                        + "updated_at=CURRENT_TIMESTAMP,version=version+1 where id=? and archived_at is null",
+                java.time.OffsetDateTime.ofInstant(removedAt, java.time.ZoneOffset.UTC), horseId);
+        jdbc.update("update module_records set status='ENDED',"
+                        + "data_json=dbo.json_modify(data_json,'$.assignedUntil',?),"
+                        + "updated_at=CURRENT_TIMESTAMP where module_code='STABLE_CARE' "
+                        + "and record_type='STALL_ASSIGNMENT' and status='ACTIVE' and horse_id=?",
+                java.time.OffsetDateTime.ofInstant(removedAt, ZoneId.of("Asia/Ho_Chi_Minh")).toString(), horseId);
+    }
+
     private void validateUniqueIdentifiers(CreateHorseRequest request) {
         String code = request.code().trim();
         if (horseRepository.existsByCodeIgnoreCase(code)) {
@@ -179,12 +386,65 @@ public class HorseService {
         }
     }
 
+    private void validateManualParents(UUID sireId, String sireName, String sireManualId,
+            UUID damId, String damName, String damManualId) {
+        validateManualParent(sireId, sireName, sireManualId, "ngựa cha");
+        validateManualParent(damId, damName, damManualId, "ngựa mẹ");
+        if (sireManualId != null && damManualId != null
+                && sireManualId.trim().equalsIgnoreCase(damManualId.trim()))
+            throw new BusinessException("ID ngựa cha và ngựa mẹ phải khác nhau");
+    }
+
+    private boolean parentChanged(Horse linkedParent, String currentManualName, String currentManualId,
+            UUID requestedParentId, String requestedManualName, String requestedManualId) {
+        UUID currentParentId = linkedParent == null ? null : linkedParent.getId();
+        return !java.util.Objects.equals(currentParentId, requestedParentId)
+                || !java.util.Objects.equals(trimToNull(currentManualName), trimToNull(requestedManualName))
+                || !java.util.Objects.equals(trimToNull(currentManualId), trimToNull(requestedManualId));
+    }
+
+    private Horse findEditableParent(UUID parentId, UUID ownerId, HorseGender gender,
+            LocalDate childBirthDate, String label) {
+        if (parentId == null) return null;
+        if (ownerId == null)
+            throw new BusinessException("Ngựa cha/mẹ được chọn phải thuộc cùng chủ sở hữu");
+        return findOwnedParent(parentId, ownerId, gender, childBirthDate, label);
+    }
+
+    private UUID soleOwnerId(Horse horse) {
+        List<HorseOwnership> ownerships = ownershipRepository.findByHorseIdOrderByOwnerUsernameAsc(horse.getId());
+        return ownerships.size() == 1 ? ownerships.getFirst().getOwner().getId() : null;
+    }
+
+    private void validateManualParent(UUID parentId, String name, String manualId, String label) {
+        boolean hasName = name != null && !name.isBlank();
+        boolean hasManualId = manualId != null && !manualId.isBlank();
+        if ((hasName || hasManualId) && parentId != null)
+            throw new BusinessException("Chọn một cách khai báo cho " + label + ": hồ sơ có sẵn hoặc nhập tay");
+        if (hasName != hasManualId)
+            throw new BusinessException("Khi nhập tay " + label + ", cần nhập cả tên và ID");
+    }
+
     private Horse findOptionalParent(UUID id, String errorMessage) {
         if (id == null) {
             return null;
         }
         return horseRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException(errorMessage + ": " + id));
+    }
+
+    private Horse findOwnedParent(UUID id, UUID ownerId, HorseGender expectedGender,
+                                  LocalDate childBirthDate, String label) {
+        if (id == null) return null;
+        if (!ownershipRepository.existsByHorseIdAndOwnerId(id, ownerId))
+            throw new ResourceNotFoundException("Không tìm thấy " + label + " được phép chọn: " + id);
+        Horse parent = findOptionalParent(id, "Không tìm thấy " + label);
+        LocalDate fourYearsAgo = LocalDate.now(clock.withZone(ZoneId.of("Asia/Ho_Chi_Minh"))).minusYears(4);
+        if (parent.getArchivedAt() != null || parent.getGender() != expectedGender
+                || !parent.getBirthDate().isBefore(fourYearsAgo)
+                || !parent.getBirthDate().isBefore(childBirthDate))
+            throw new BusinessException("Hồ sơ " + label + " phải chưa lưu trữ, trên 4 tuổi, đúng giới tính và lớn tuổi hơn ngựa con");
+        return parent;
     }
 
     private Horse findHorse(UUID id) {
@@ -241,5 +501,9 @@ public class HorseService {
 
     private String normalizeNullable(String value) {
         return value == null || value.isBlank() ? null : value.trim().toUpperCase();
+    }
+
+    private String trimToNull(String value) {
+        return value == null || value.isBlank() ? null : value.trim();
     }
 }

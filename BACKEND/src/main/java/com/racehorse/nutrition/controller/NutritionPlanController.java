@@ -1,14 +1,15 @@
 package com.racehorse.nutrition.controller;
 
-import com.racehorse.nutrition.dto.CreateNutritionPlanRequest;
-import com.racehorse.nutrition.dto.DailyFeedingChecklistResponse;
-import com.racehorse.nutrition.dto.NutritionPlanResponse;
+import com.racehorse.nutrition.dto.*;
 import com.racehorse.nutrition.service.NutritionPlanService;
+import com.racehorse.horse.service.OwnerHorseReadGuard;
+import com.racehorse.stable.service.StaffHorseGuard;
 import jakarta.validation.Valid;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.core.Authentication;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
 
@@ -21,22 +22,30 @@ import java.util.UUID;
 public class NutritionPlanController {
 
     private final NutritionPlanService service;
+    private final OwnerHorseReadGuard ownerGuard;
+    private final StaffHorseGuard staffHorseGuard;
 
-    public NutritionPlanController(NutritionPlanService service) {
+    public NutritionPlanController(NutritionPlanService service, OwnerHorseReadGuard ownerGuard, StaffHorseGuard staffHorseGuard) {
         this.service = service;
+        this.ownerGuard = ownerGuard;
+        this.staffHorseGuard = staffHorseGuard;
     }
 
     @GetMapping
     @PreAuthorize("hasAuthority('PERM_STABLE_CARE_VIEW')")
     public NutritionPlanResponse getActivePlan(
             @PathVariable UUID horseId,
-            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+            @AuthenticationPrincipal Jwt jwt, Authentication authentication) {
+        ownerGuard.requireHorse(horseId, jwt, authentication);
         return service.getEffectivePlan(horseId, date);
     }
 
     @GetMapping("/history")
     @PreAuthorize("hasAuthority('PERM_STABLE_CARE_VIEW')")
-    public List<NutritionPlanResponse> getHistory(@PathVariable UUID horseId) {
+    public List<NutritionPlanResponse> getHistory(@PathVariable UUID horseId,
+            @AuthenticationPrincipal Jwt jwt, Authentication authentication) {
+        ownerGuard.requireHorse(horseId, jwt, authentication);
         return service.getHistory(horseId);
     }
 
@@ -44,17 +53,50 @@ public class NutritionPlanController {
     @PreAuthorize("hasAuthority('PERM_STABLE_CARE_VIEW')")
     public DailyFeedingChecklistResponse getDailyChecklist(
             @PathVariable UUID horseId,
-            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+            @AuthenticationPrincipal Jwt jwt, Authentication authentication) {
+        ownerGuard.requireHorse(horseId, jwt, authentication);
+        staffHorseGuard.requireCaretaker(horseId, UUID.fromString(jwt.getSubject()), authentication);
         return service.getDailyChecklist(horseId, date);
+    }
+
+    @GetMapping("/template-options")
+    @PreAuthorize("hasAuthority('PERM_STABLE_CARE_VIEW')")
+    public List<FeedingTemplateOptionView> getTemplateOptions(
+            @PathVariable UUID horseId,
+            @AuthenticationPrincipal Jwt jwt, Authentication authentication) {
+        ownerGuard.requireHorse(horseId, jwt, authentication);
+        return service.getTemplateOptionsForHorse(horseId);
+    }
+
+    @PostMapping("/apply-template")
+    @ResponseStatus(HttpStatus.CREATED)
+    @PreAuthorize("hasAnyRole('STABLE_STAFF','VETERINARIAN','HEAD_TRAINER','CLUB_MANAGER') and hasAuthority('PERM_STABLE_CARE_EDIT')")
+    public NutritionPlanResponse applyStandardTemplate(
+            @PathVariable UUID horseId,
+            @AuthenticationPrincipal Jwt jwt,
+            Authentication authentication,
+            @Valid @RequestBody ApplyFeedingTemplateRequest request) {
+        staffHorseGuard.requireCaretaker(horseId, UUID.fromString(jwt.getSubject()), authentication);
+        return service.applyStandardTemplate(horseId, UUID.fromString(jwt.getSubject()), request);
     }
 
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
-    @PreAuthorize("hasAnyRole('VETERINARIAN','HEAD_TRAINER','CLUB_MANAGER') and hasAuthority('PERM_STABLE_CARE_EDIT')")
+    @PreAuthorize("hasAnyRole('VETERINARIAN','HEAD_TRAINER','CLUB_MANAGER') and (hasAuthority('PERM_STABLE_CARE_EDIT') or hasAuthority('PERM_MEDICAL_EDIT'))")
     public NutritionPlanResponse createPlan(
             @PathVariable UUID horseId,
             @AuthenticationPrincipal Jwt jwt,
             @Valid @RequestBody CreateNutritionPlanRequest request) {
         return service.createPlan(horseId, UUID.fromString(jwt.getSubject()), request);
+    }
+
+    @DeleteMapping
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @PreAuthorize("hasAnyRole('VETERINARIAN','HEAD_TRAINER','CLUB_MANAGER') and (hasAuthority('PERM_STABLE_CARE_EDIT') or hasAuthority('PERM_MEDICAL_EDIT'))")
+    public void deleteActivePlan(
+            @PathVariable UUID horseId,
+            @AuthenticationPrincipal Jwt jwt) {
+        service.deleteActivePlan(horseId, UUID.fromString(jwt.getSubject()));
     }
 }

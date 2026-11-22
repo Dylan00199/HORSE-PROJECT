@@ -16,6 +16,8 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 
+import java.sql.ResultSet;
+import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -90,6 +92,43 @@ class InjuryServiceTest {
         // Verify 2 inserts: marker and initial recovery timeline update
         verify(jdbc, times(2)).update(contains("insert into module_records"),
                 any(), any(), any(), any(), any(), anyString());
+        verify(jdbc).update(contains("update horses set health_status"), eq(vetId), any(UUID.class), eq(horseId));
+        verify(jdbc).update(contains("insert into training_locks"),
+                any(UUID.class), eq(horseId), anyString(), eq(vetId), eq(horseId));
+    }
+
+    @Test
+    void detailKeepsStructuredRegionsAndAdditionalNotes() throws Exception {
+        UUID injuryId = UUID.randomUUID();
+        UUID horseId = UUID.randomUUID();
+        UUID vetId = UUID.randomUUID();
+        ResultSet row = mock(ResultSet.class);
+        when(row.getObject("id", UUID.class)).thenReturn(injuryId);
+        when(row.getObject("horse_id", UUID.class)).thenReturn(horseId);
+        when(row.getObject("user_id", UUID.class)).thenReturn(vetId);
+        when(row.getString("horse_code")).thenReturn("H-01");
+        when(row.getString("horse_name")).thenReturn("Horse");
+        when(row.getString("username")).thenReturn("doctor");
+        when(row.getString("data_json")).thenReturn("""
+                {"bodyLocation":"Gối trước phải","bodyRegions":["FL_KNEE_RIGHT"],
+                 "additionalNotes":"Mặt ngoài","severity":"MODERATE","currentStatus":"ACUTE"}
+                """);
+        when(row.getObject("created_at", OffsetDateTime.class)).thenReturn(OffsetDateTime.now());
+        when(row.getObject("updated_at", OffsetDateTime.class)).thenReturn(OffsetDateTime.now());
+        when(jdbc.query(contains("select m.id"), any(RowMapper.class), eq(injuryId)))
+                .thenAnswer(invocation -> {
+                    RowMapper<?> mapper = invocation.getArgument(1);
+                    return List.of(mapper.mapRow(row, 0));
+                });
+        when(jdbc.query(contains("select u.id"), any(RowMapper.class), eq(injuryId.toString())))
+                .thenReturn(List.of());
+
+        var detail = service.getDetail(injuryId, vetId, true);
+
+        assertThat(detail.bodyRegions()).containsExactly("FL_KNEE_RIGHT");
+        assertThat(detail.additionalNotes()).isEqualTo("Mặt ngoài");
+        assertThat(detail.x()).isNull();
+        verify(horseAccessService).requireReadable(horseId, vetId, true);
     }
 
     @Test
@@ -135,5 +174,55 @@ class InjuryServiceTest {
         assertThatThrownBy(() -> service.addRecoveryUpdate(injuryId, vetId, req))
                 .isInstanceOf(ResourceNotFoundException.class)
                 .hasMessageContaining("Không tìm thấy dấu chấn thương");
+    }
+
+    @Test
+    void healingLastInjuryReleasesOnlyAutomaticTrainingLock() {
+        UUID injuryId = UUID.randomUUID();
+        UUID horseId = UUID.randomUUID();
+        UUID vetId = UUID.randomUUID();
+        when(jdbc.queryForList(contains("select id, horse_id, data_json"), eq(injuryId)))
+                .thenReturn(List.of(Map.of("id", injuryId, "horse_id", horseId, "data_json", "{}")));
+        when(jdbc.queryForObject(contains("select id from horses where id=? for update"), eq(UUID.class), eq(horseId)))
+                .thenReturn(horseId);
+        when(jdbc.queryForObject(contains("select count(*) from module_records"), eq(Integer.class), eq(horseId)))
+                .thenReturn(0);
+
+        service.addRecoveryUpdate(injuryId, vetId,
+                new AddInjuryRecoveryUpdateRequest("HEALED", "Đã bình phục", List.of()));
+
+        verify(jdbc).update(contains("health_source_type='INJURY_MARKER'"), eq(vetId), eq(horseId));
+        verify(jdbc).update(contains("reason like 'Tự động khóa:%'"), eq(vetId), eq(horseId), eq(horseId));
+    }
+
+    @Test
+    void deleteRemovesMarkerAndRecoveryUpdates() {
+        UUID injuryId = UUID.randomUUID();
+        UUID horseId = UUID.randomUUID();
+        UUID actorId = UUID.randomUUID();
+
+        when(jdbc.queryForList(contains("record_type in ('INJURY_MARKER', 'INJURY')"), eq(injuryId)))
+                .thenReturn(List.of(Map.of("horse_id", horseId)));
+
+        service.delete(injuryId, actorId);
+
+        verify(horseAccessService).requireActive(horseId);
+        verify(jdbc).update(contains("record_type='INJURY_RECOVERY_UPDATE'"),
+                eq(injuryId.toString()), eq(injuryId.toString()), anyString());
+        verify(jdbc).update(contains("delete from module_records where id=? and module_code='MEDICAL' and record_type in ('INJURY_MARKER', 'INJURY')"),
+                eq(injuryId));
+    }
+
+    @Test
+    void deleteThrowsWhenInjuryNotFound() {
+        UUID injuryId = UUID.randomUUID();
+        UUID actorId = UUID.randomUUID();
+
+        when(jdbc.queryForList(contains("record_type in ('INJURY_MARKER', 'INJURY')"), eq(injuryId)))
+                .thenReturn(List.of());
+
+        assertThatThrownBy(() -> service.delete(injuryId, actorId))
+                .isInstanceOf(ResourceNotFoundException.class)
+                .hasMessageContaining("Không tìm thấy thông tin chấn thương");
     }
 }

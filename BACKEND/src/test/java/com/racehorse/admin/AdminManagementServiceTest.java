@@ -2,6 +2,7 @@ package com.racehorse.admin;
 
 import com.racehorse.audit.service.AuditService;
 import com.racehorse.common.exception.BusinessException;
+import com.racehorse.auth.service.AccountActivityGuard;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -26,11 +27,12 @@ class AdminManagementServiceTest {
     @Mock JdbcTemplate jdbc;
     @Mock PasswordEncoder encoder;
     @Mock AuditService audit;
+    @Mock AccountActivityGuard activityGuard;
     private AdminManagementService service;
 
     @BeforeEach
     void setUp() {
-        service = new AdminManagementService(jdbc, encoder, audit, new ObjectMapper());
+        service = new AdminManagementService(jdbc, encoder, audit, new ObjectMapper(), activityGuard);
     }
 
     @Test
@@ -59,9 +61,26 @@ class AdminManagementServiceTest {
     }
 
     @Test
+    void accountWithActiveAssignmentCannotBeDisabled() {
+        UUID actor = UUID.randomUUID();
+        UUID target = UUID.randomUUID();
+        accountSnapshot(target, true);
+        org.mockito.Mockito.doThrow(new BusinessException("Còn ca khám"))
+                .when(activityGuard).requireNoActiveAssignments(target);
+
+        assertThatThrownBy(() -> service.setEnabled(actor, target, false))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Còn ca khám");
+
+        verify(jdbc, never()).update(org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.<Object[]>any());
+        verifyNoInteractions(audit);
+    }
+
+    @Test
     void restoreRejectsHorseThatIsNotArchived() {
         UUID horseId = UUID.randomUUID();
-        when(jdbc.update("update horses set archived_at=null,updated_at=SYSDATETIMEOFFSET(),version=version+1 where id=? and archived_at is not null", horseId))
+        when(jdbc.update("update horses set archived_at=null,updated_at=CURRENT_TIMESTAMP,version=version+1 where id=? and archived_at is not null", horseId))
                 .thenReturn(0);
 
         assertThatThrownBy(() -> service.restore(UUID.randomUUID(), horseId))
@@ -98,7 +117,7 @@ class AdminManagementServiceTest {
         service.updateServiceAccess(actor, horseId, null, true, "Club Manager bảo lãnh", null);
 
         verify(jdbc).update(
-                "update horses set payment_status=?, service_override=?, override_reason=?, paid_until=?, updated_at=SYSDATETIMEOFFSET(), version=version+1 where id=?",
+                "update horses set payment_status=?, service_override=?, override_reason=?, paid_until=?, updated_at=CURRENT_TIMESTAMP, version=version+1 where id=?",
                 "PENDING_PAYMENT", true, "Club Manager bảo lãnh", null, horseId);
         verify(audit).record(
                 org.mockito.ArgumentMatchers.eq(actor),
